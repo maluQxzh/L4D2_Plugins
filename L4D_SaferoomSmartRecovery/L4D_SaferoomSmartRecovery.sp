@@ -12,7 +12,7 @@ public Plugin:myinfo =
 	author = "maluQxzh",
 	description = "Restore health to 50 (100 on some maps)upon entering the next chapter, or retain health under specific circumstances.",
 	version = PLUGIN_VERSION,
-	url = "https://steamcommunity.com/profiles/76561198365450025/"
+	url = "https://github.com/maluQxzh/L4D2_Plugins"
 }
 
 int
