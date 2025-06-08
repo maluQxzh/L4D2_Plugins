@@ -236,7 +236,10 @@ public Action Timer_RoundStart(Handle timer)
 					if (IsClientConnected(i) && GetClientTeam(i) == 2)
 					{
 						RemoveBlackAndWhite(i);
-						SetPlayerHealth(i, 100);
+						if (GetClientHealth(i) < 100)
+						{
+							SetPlayerHealth(i, 100);
+						}
 					}
 				}
 			}
@@ -259,7 +262,10 @@ public Action Timer_RoundStart(Handle timer)
 				if (CheckPosition(pos))
 				{
 					RemoveBlackAndWhite(i);
-					SetPlayerHealth(i, 100);
+					if (GetClientHealth(i) < 100)
+					{
+						SetPlayerHealth(i, 100);
+					}
 				}
 				else
 				{
