@@ -2,7 +2,7 @@
 #include <sourcemod>
 #include <sdktools_sound>
 #include <left4dhooks>
-#define PLUGIN_VERSION "1.0.2"
+#define PLUGIN_VERSION "1.1.0"
 
 #define NAV_MESH_PLAYER_START 128 // 玩家起始区域标志
 
@@ -17,6 +17,8 @@ public Plugin:myinfo =
 
 /*
 change log:
+v1.1.0
+	Optimized the decision logic for health restoration at the beginning of chapters.
 v1.0.2
 	Fix Bugs
 v1.0.1
@@ -33,8 +35,9 @@ int
 	iHealthToSet,
 	iUseTempHealthRemain,
 	iTempHealthRemainValue,
-	iDebugInfo;
-	g_iPlayerCheckTime;
+	iDebugInfo,
+	g_iPlayerCheckTime,
+	g_iPlayerHealedFlags;  // 用于记录已处理的玩家位标记
 ConVar
 	hUseCustomValue,
 	hCustomSaferoomHealth,
@@ -42,6 +45,9 @@ ConVar
 	hUseTempHealthRemain,
 	hTempHealthRemainValue,
 	hDebugInfo;
+bool
+	g_bInfoPlayerStartHasAttribute;
+	g_bIsLeftSafeArea;
 
 public void OnPluginStart()
 {
@@ -65,7 +71,8 @@ public void OnPluginStart()
 	
 	HookEvent("map_transition", Event_MapTransition, EventHookMode_Pre);
 	HookEvent("round_start_post_nav", Event_RoundStartPostNav, EventHookMode_PostNoCopy);
-	HookEvent("round_end", Event_RoundEnd);
+	//HookEvent("round_end", Event_RoundEnd);
+	HookEvent("player_left_safe_area", Event_PlayerLeftSafeArea);
 }
 
 bool PrintDebugInfo(ConVar hd)
@@ -143,13 +150,48 @@ bool CheckPosition(float pos[3])
 	}
 }
 
+bool CheckPlayerReady(int client)
+{
+	if ((IsClientConnected(client) && !IsClientInGame(client)) || !IsClientConnected(client))
+	{
+		return false;
+	}
+	return true;
+}
+
+bool CheckEntityHasAttribute()
+{
+	int entity = -1;
+	float origin[3];
+
+	while ((entity = FindEntityByClassname(entity, "info_player_start")) != -1)
+	{
+		if (PrintDebugInfo(hDebugInfo))
+			PrintToChatAll("info_player_start entity: Find");
+		GetEntPropVector(entity, Prop_Data, "m_vecOrigin", origin);
+		if (CheckPosition(origin))
+		{
+			//foundPlayerStart = true;
+			if (PrintDebugInfo(hDebugInfo))
+				PrintToChatAll("NAV_MESH_PLAYER_START: Yes");
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+	if (PrintDebugInfo(hDebugInfo))
+			PrintToChatAll("info_player_start entity: Not Find");
+	return false;
+}
+
 bool CheckAllPlayerReady()
 {
 	for (new i = 1; i <= MaxClients; i++)
 	{
 		if ((IsClientConnected(i)) == true && (IsClientInGame(i)== false))
 		{
-			g_iPlayerCheckTime++;
 			return false;
 		}
 	}
@@ -158,32 +200,31 @@ bool CheckAllPlayerReady()
 	return true;
 }
 
-public void OnMapStart()
-{
-	g_iPlayerCheckTime = 0;
-}
-
-public void OnMapEnd()
-{
-	g_iPlayerCheckTime = 0;
-}
-
 public void Event_RoundStartPostNav(Event event, const char[] name, bool dontBroadcast)
 {
+	if (PrintDebugInfo(hDebugInfo))
+			PrintToChatAll("MapNavComplete");
+	
+	g_iPlayerCheckTime = 0;
+	g_iPlayerHealedFlags = 0;
+	g_bInfoPlayerStartHasAttribute = false;
+	g_bIsLeftSafeArea = false;
+
 	iUseCustomValue = hUseCustomValue.IntValue;
 	if (iUseCustomValue == 0)
-	{
-		if (PrintDebugInfo(hDebugInfo))
-			PrintToChatAll("MapNavComplete");
+	{	
+		if (CheckEntityHasAttribute())
+		{
+			g_bInfoPlayerStartHasAttribute = true;
+		}
+
 		CreateTimer(0.5, Timer_RoundStart, _, TIMER_REPEAT);
 	}
 }
 
-public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast)
+public void Event_PlayerLeftSafeArea(Event event, const char[] name, bool dontBroadcast)
 {
-	if (PrintDebugInfo(hDebugInfo))
-		PrintToChatAll("RoundEnd");
-	g_iPlayerCheckTime = 0;
+    g_bIsLeftSafeArea = true;
 }
 
 public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBroadcast) 
@@ -205,7 +246,7 @@ public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBr
 	}
 	for (new i = 1; i <= MaxClients; i++)
 	{
-		if (IsClientConnected(i) && GetClientTeam(i) == 2)
+		if (IsClientConnected(i) && IsClientInGame(i) && GetClientTeam(i) == 2)
 		{
 			if (IsPlayerFalling(i))
 			{
@@ -218,7 +259,7 @@ public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBr
 			//SetEntProp(i, Prop_Send, "m_iHideHUD", 64);
 			if (iRemoveBlackAndWhite == 1)
 			{
-			RemoveBlackAndWhite(i);
+				RemoveBlackAndWhite(i);
 			}
 			if (iUseTempHealthRemain == 1)
 			{
@@ -236,82 +277,79 @@ public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBr
 			}
 		}
 	}
-	g_iPlayerCheckTime = 0;
+	
 	return Plugin_Continue;
 }
 
-void RoundStartHealing()
+void RoundStartHealingForPlayer(int client)
 {
-	int entity = -1;
-	float origin[3];
-	while ((entity = FindEntityByClassname(entity, "info_player_start")) != -1)
+	if (g_bInfoPlayerStartHasAttribute)
 	{
-		if (PrintDebugInfo(hDebugInfo))
-			PrintToChatAll("info_player_start entity: find");
-		GetEntPropVector(entity, Prop_Data, "m_vecOrigin", origin);
-		if (CheckPosition(origin))
+		if (GetClientHealth(client) < 100)
 		{
+			SetPlayerHealth(client, 100);
 			if (PrintDebugInfo(hDebugInfo))
-				PrintToChatAll("NAV_MESH_PLAYER_START: Yes");
-			for (new i = 1; i <= MaxClients; i++)
+				PrintToServer("Healing");
+		}
+		return;
+	}
+	else
+	{
+		float pos[3];
+		GetClientAbsOrigin(client, pos);
+		if (CheckPosition(pos))
+		{
+			if (GetClientHealth(client) < 100)
 			{
-				if (IsClientConnected(i) && GetClientTeam(i) == 2)
-				{
-					RemoveBlackAndWhite(i);
-					if (GetClientHealth(i) < 100)
-					{
-						SetPlayerHealth(i, 100);
-					}
-				}
+				if (PrintDebugInfo(hDebugInfo))
+					PrintToChat(client, "NAV_MESH_PLAYER_START: Yes");
+				if (PrintDebugInfo(hDebugInfo))
+					PrintToServer("Healing");
+				SetPlayerHealth(client, 100);
 			}
 		}
 		else
 		{
 			if (PrintDebugInfo(hDebugInfo))
-				PrintToChatAll("NAV_MESH_PLAYER_START: No");
+				PrintToChat(client, "NAV_MESH_PLAYER_START: No");
+			if (PrintDebugInfo(hDebugInfo))
+				PrintToServer("No Healing");
 		}
-		return;
 	}
-	if (PrintDebugInfo(hDebugInfo))
-		PrintToChatAll("info_player_start entity: not find");
-	for (new i = 1; i <= MaxClients; i++)
-	{
-		if (IsClientConnected(i) && GetClientTeam(i) == 2)
-		{
-			float pos[3];
-			// 获取玩家当前位置
-			GetClientAbsOrigin(i, pos);
-			if (CheckPosition(pos))
-			{
-				RemoveBlackAndWhite(i);
-				if (GetClientHealth(i) < 100)
-				{
-					SetPlayerHealth(i, 100);
-				}
-			}
-			else
-			{
-				if (PrintDebugInfo(hDebugInfo))
-					PrintToChat(i, "NAV_MESH_PLAYER_START: No");
-			}
-		}
-		
-	}
-	return;
 }
 
 public Action Timer_RoundStart(Handle timer)
-{
+{	
+	g_iPlayerCheckTime++;
+	if (PrintDebugInfo(hDebugInfo))
+		PrintToServer("PlayerCheckTime: %d", g_iPlayerCheckTime);
+	
+	// 检查每个玩家，对已准备好的玩家进行治疗
+	for (new i = 1; i <= MaxClients; i++)
+	{
+		if (CheckPlayerReady(i))
+		{
+			// 玩家已准备好且未被治疗过
+			if (!(g_iPlayerHealedFlags & (1 << i)) && GetClientTeam(i) == 2)
+			{
+				RoundStartHealingForPlayer(i);
+			}
+			g_iPlayerHealedFlags |= (1 << i);  // 标记玩家已检查
+		}
+	}
+
 	if (CheckAllPlayerReady())
 	{
-		RoundStartHealing();
 		return Plugin_Stop;
 	}
-	if (g_iPlayerCheckTime == 60)
+	
+	// 如果超过600次检查（五分钟）仍然有玩家未准备好或有玩家已经离开安全区域，停止定时器
+	if (g_iPlayerCheckTime >= 600 || g_bIsLeftSafeArea)
 	{
 		if (PrintDebugInfo(hDebugInfo))
 			PrintToChatAll("CheckAllPlayerReadyFalse");
 		return Plugin_Stop;
 	}
+	
 	return Plugin_Continue;
 }
