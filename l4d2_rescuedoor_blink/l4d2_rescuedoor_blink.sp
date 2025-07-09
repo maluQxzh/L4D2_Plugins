@@ -35,6 +35,12 @@ public Plugin:myinfo =
 	url = "https://github.com/maluQxzh/L4D2_Plugins"
 }
 
+/*
+change log:
+v1.0.0
+	Initial Release
+*/
+
 int
     currentCount;
 ArrayList
