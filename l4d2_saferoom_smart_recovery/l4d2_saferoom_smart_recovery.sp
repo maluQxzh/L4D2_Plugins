@@ -17,8 +17,11 @@ public Plugin:myinfo =
 
 /*
 change log:
+v1.1.1
+	Remove ConVar "l4d2_saferoom_smart_recovery_RemoveBlackAndWhite", plugin automatically handles whether to remove black and white status
+	When players trigger temporary health retention to the next chapter, the plugin will not perform any processing
 v1.1.0
-	Optimized the decision logic for health restoration at the beginning of chapters.
+	Optimized the decision logic for health restoration at the beginning of chapters
 v1.0.2
 	Fix Bugs
 v1.0.1
@@ -31,7 +34,7 @@ int
 	iSurvivorRespawnHealth,
 	iCustomSaferoomHealth,
 	iUseCustomValue,
-	iRemoveBlackAndWhite,
+	//iRemoveBlackAndWhite,
 	iHealthToSet,
 	iUseTempHealthRemain,
 	iTempHealthRemainValue,
@@ -41,7 +44,7 @@ int
 ConVar
 	hUseCustomValue,
 	hCustomSaferoomHealth,
-	hRemoveBlackAndWhite,
+	//hRemoveBlackAndWhite,
 	hUseTempHealthRemain,
 	hTempHealthRemainValue,
 	hDebugInfo;
@@ -62,7 +65,7 @@ public void OnPluginStart()
 	
 	hUseCustomValue = CreateConVar("l4d2_saferoom_smart_recovery_CanWeUseCustomValue", "0", "0=默认为50(z_survivor_respawn_health)(部分地图为100)，1=启用自定义恢复值   If set to 0, the default recovery value is 50 (100 on some maps); if set to 1, custom recovery values are enabled.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
 	hCustomSaferoomHealth = CreateConVar("l4d2_saferoom_smart_recovery_CustomSaferoomHealth", "50", "启用自定义恢复值时有效，回复至多少生命值   Effective if custom recovery values are enabled – how much health is restored to.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 1.0, true, 100.0);
-	hRemoveBlackAndWhite = CreateConVar("l4d2_saferoom_smart_recovery_RemoveBlackAndWhite", "1", "是否移除黑白和心跳声   Whether to remove the black and white effect and heartbeat sound.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
+	//hRemoveBlackAndWhite = CreateConVar("l4d2_saferoom_smart_recovery_RemoveBlackAndWhite", "1", "是否移除黑白和心跳声   Whether to remove the black and white effect and heartbeat sound.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
 	hUseTempHealthRemain = CreateConVar("l4d2_saferoom_smart_recovery_UseTempHealthRemain", "1", "是否启用保留虚血   Whether to enable remaining temporary health values.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
 	hTempHealthRemainValue = CreateConVar("l4d2_saferoom_smart_recovery_TempHealthRemainValue", "20", "启用保留虚血时有效，实血+虚血大于等于设定恢复值多少时保留   Effective when retaining temporary health values is enabled. Retain when the sum of health and temporary health is greater than or equal to TempHealthRemainValue.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 99.0);
 	hDebugInfo = CreateConVar("l4d2_saferoom_smart_recovery_hDebugInfo", "0", "是否输出调试信息", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
@@ -232,7 +235,7 @@ public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBr
 	iCustomSaferoomHealth = hCustomSaferoomHealth.IntValue;
 	iUseCustomValue = hUseCustomValue.IntValue;
 	iSurvivorRespawnHealth = FindConVar("z_survivor_respawn_health").IntValue;
-	iRemoveBlackAndWhite = hRemoveBlackAndWhite.IntValue;
+	//iRemoveBlackAndWhite = hRemoveBlackAndWhite.IntValue;
 	iUseTempHealthRemain = hUseTempHealthRemain.IntValue;
 	iTempHealthRemainValue = hTempHealthRemainValue.IntValue;
 	
@@ -257,15 +260,12 @@ public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBr
 				L4D2_VScriptWrapper_ReviveFromIncap(i);
 			}
 			//SetEntProp(i, Prop_Send, "m_iHideHUD", 64);
-			if (iRemoveBlackAndWhite == 1)
-			{
-				RemoveBlackAndWhite(i);
-			}
 			if (iUseTempHealthRemain == 1)
 			{
 				if ((GetClientHealth(i) + GetPlayerTempHealth(i) <= iHealthToSet + iTempHealthRemainValue) && (GetClientHealth(i) < iHealthToSet))
 				{
 					SetPlayerHealth(i, iHealthToSet);
+					RemoveBlackAndWhite(i);
 				}
 			}
 			else
@@ -273,6 +273,7 @@ public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBr
 				if (GetClientHealth(i) <= iHealthToSet)
 				{
 					SetPlayerHealth(i, iHealthToSet);
+					RemoveBlackAndWhite(i);
 				}
 			}
 		}
@@ -288,6 +289,7 @@ void RoundStartHealingForPlayer(int client)
 		if (GetClientHealth(client) < 100)
 		{
 			SetPlayerHealth(client, 100);
+			RemoveBlackAndWhite(client);
 			if (PrintDebugInfo(hDebugInfo))
 				PrintToServer("Healing");
 		}
@@ -306,6 +308,7 @@ void RoundStartHealingForPlayer(int client)
 				if (PrintDebugInfo(hDebugInfo))
 					PrintToServer("Healing");
 				SetPlayerHealth(client, 100);
+				RemoveBlackAndWhite(client);
 			}
 		}
 		else
