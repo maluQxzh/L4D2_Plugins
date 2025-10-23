@@ -2,6 +2,7 @@
 #include <sdktools>
 #include <left4dhooks>
 #include <multicolors>
+#pragma newdecls required
 #define PLUGIN_VERSION "1.2.0"
 
 #define MAX_SEARCH_DIST 600   // 救援实体为圆心最大搜索距离
@@ -10,7 +11,7 @@
 #define NAV_MESH_RESCUE_CLOSET 65536
 
 
-public Plugin:myinfo = 
+public Plugin myinfo = 
 {
 	name = "l4d2_rescuedoor_blink",
 	author = "maluQxzh",
@@ -49,7 +50,7 @@ int
     g_iCurrentCount,
     g_iTotalRescuePoints;    // 本章节救援点总数
 float
-    g_fLastNotifyTime
+    g_fLastNotifyTime;
 
 // 门类型数组
 char g_DoorTypes[][64] = {
@@ -58,10 +59,10 @@ char g_DoorTypes[][64] = {
 };
 
 ArrayList
-    g_BlinkingDoors,
-    g_BlinkColors,    // 存储颜色数组
-    g_RescuePoints,   // 存储救援点实体
-    g_DoorEntityCounts; // 存储门实体和对应的关联次数（成对存储：实体ID，计数）
+    g_aBlinkingDoors,
+    g_aBlinkColors,    // 存储颜色数组
+    g_aRescuePoints,   // 存储救援点实体
+    g_aDoorEntityCounts; // 存储门实体和对应的关联次数（成对存储：实体ID，计数）
 // 轮廓系统变量
 int g_iOutlineIndex[2048] = {0};  // 存储每个实体对应的轮廓实体引用
 Handle
@@ -72,7 +73,7 @@ ConVar
 
 public void OnPluginStart()
 {
-    decl String:game_name[64];
+    char game_name[64];
     GetGameFolderName(game_name, sizeof(game_name));
     if (!StrEqual(game_name, "left4dead2", false))
         SetFailState("Plugin supports Left 4 Dead 2 only.");
@@ -86,10 +87,10 @@ public void OnPluginStart()
     AutoExecConfig(true, "l4d2_rescuedoor_blink");
 
     g_fLastNotifyTime = GetGameTime();
-    g_BlinkingDoors = new ArrayList();
-    g_BlinkColors = new ArrayList(3); // 存储RGB值，每个颜色3个值
-    g_RescuePoints = new ArrayList(); // 存储救援点实体标记
-    g_DoorEntityCounts = new ArrayList(2); // 存储门实体和计数（每个条目2个值：实体ID，计数）
+    g_aBlinkingDoors = new ArrayList();
+    g_aBlinkColors = new ArrayList(3); // 存储RGB值，每个颜色3个值
+    g_aRescuePoints = new ArrayList(); // 存储救援点实体标记
+    g_aDoorEntityCounts = new ArrayList(2); // 存储门实体和计数（每个条目2个值：实体ID，计数）
 
     // 初始化颜色配置
     UpdateBlinkColors();
@@ -111,10 +112,16 @@ public void OnPluginStart()
     HookEvent("finale_vehicle_leaving", Event_RoundEnd);//救援载具离开之时  (没有触发round_end)
 }
 
+// 预缓存自定义用于轮廓的模型，避免出现 "late precache of models/...atlas_break_ball.mdl" 提示
+public void OnMapStart()
+{
+    PrecacheModel("models/props_unique/airport/atlas_break_ball.mdl", true);
+}
+
 // 解析颜色配置字符串
 void UpdateBlinkColors()
 {
-    g_BlinkColors.Clear();
+    g_aBlinkColors.Clear();
     
     char colorString[512];
     GetConVarString(g_hBlinkColors, colorString, sizeof(colorString));
@@ -138,29 +145,29 @@ void UpdateBlinkColors()
             g = (g < 0) ? 0 : ((g > 255) ? 255 : g);
             b = (b < 0) ? 0 : ((b > 255) ? 255 : b);
             
-            g_BlinkColors.Push(r);
-            g_BlinkColors.Push(g);
-            g_BlinkColors.Push(b);
+            g_aBlinkColors.Push(r);
+            g_aBlinkColors.Push(g);
+            g_aBlinkColors.Push(b);
         }
     }
     
     // 如果没有有效颜色，使用默认颜色（RGB格式）
-    if (g_BlinkColors.Length == 0)
+    if (g_aBlinkColors.Length == 0)
     {
         // 默认红色
-        g_BlinkColors.Push(255);
-        g_BlinkColors.Push(0);
-        g_BlinkColors.Push(0);
+    g_aBlinkColors.Push(255);
+    g_aBlinkColors.Push(0);
+    g_aBlinkColors.Push(0);
         
         // 默认黄色
-        g_BlinkColors.Push(255);
-        g_BlinkColors.Push(255);
-        g_BlinkColors.Push(0);
+    g_aBlinkColors.Push(255);
+    g_aBlinkColors.Push(255);
+    g_aBlinkColors.Push(0);
         
         // 默认白色
-        g_BlinkColors.Push(255);
-        g_BlinkColors.Push(255);
-        g_BlinkColors.Push(255);
+    g_aBlinkColors.Push(255);
+    g_aBlinkColors.Push(255);
+    g_aBlinkColors.Push(255);
     }
 }
 
@@ -175,11 +182,12 @@ public void OnBlinkSpeedChanged(ConVar convar, const char[] oldValue, const char
     // 重新启动计时器以应用新的速度
     if (g_hTimer != null)
     {
-        CloseHandle(g_hTimer);
+        if (IsValidHandle(g_hTimer))
+            delete g_hTimer;
         g_hTimer = null;
         
         float blinkSpeed = GetConVarFloat(g_hBlinkSpeed);
-        g_hTimer = CreateTimer(blinkSpeed, Timer_DoorBlink, _, TIMER_REPEAT);
+        g_hTimer = CreateTimer(blinkSpeed, Timer_DoorBlink, _, TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
     }
 }
 
@@ -329,9 +337,9 @@ void RemoveEntityOutline(int entity)
 // 清理g_BlinkingDoors中的门实体的轮廓
 void ClearDoorOutlines()
 {
-    for (int i = 0; i < g_BlinkingDoors.Length; i++)
+    for (int i = 0; i < g_aBlinkingDoors.Length; i++)
     {
-        int door = g_BlinkingDoors.Get(i);
+        int door = g_aBlinkingDoors.Get(i);
         if (IsValidEntity(door) && g_iOutlineIndex[door] != 0)
             RemoveEntityOutline(door);
     }
@@ -557,18 +565,18 @@ bool AddDoorWithCount(int doorEntity)
     if (doorEntity == -1) return false;
     
     // 检查门是否已经在闪烁列表中
-    int doorIndex = g_BlinkingDoors.FindValue(doorEntity);
+    int doorIndex = g_aBlinkingDoors.FindValue(doorEntity);
     bool doorExists = (doorIndex != -1);
     
     // 如果门不在闪烁列表中，添加它
     if (!doorExists)
-        g_BlinkingDoors.Push(doorEntity);
+        g_aBlinkingDoors.Push(doorEntity);
     
     // 查找门实体在计数数组中的位置
     int countIndex = -1;
-    for (int i = 0; i < g_DoorEntityCounts.Length; i += 2)
+    for (int i = 0; i < g_aDoorEntityCounts.Length; i += 2)
     {
-        if (g_DoorEntityCounts.Get(i) == doorEntity)
+        if (g_aDoorEntityCounts.Get(i) == doorEntity)
         {
             countIndex = i;
             break;
@@ -578,14 +586,14 @@ bool AddDoorWithCount(int doorEntity)
     if (countIndex != -1)
     {
         // 门实体已存在，增加计数
-        int doorCurrentCount = g_DoorEntityCounts.Get(countIndex + 1);
-        g_DoorEntityCounts.Set(countIndex + 1, doorCurrentCount + 1);
+        int doorCurrentCount = g_aDoorEntityCounts.Get(countIndex + 1);
+        g_aDoorEntityCounts.Set(countIndex + 1, doorCurrentCount + 1);
     }
     else
     {
         // 门实体不存在，添加新记录
-        g_DoorEntityCounts.Push(doorEntity);
-        g_DoorEntityCounts.Push(1); // 初始计数为1
+        g_aDoorEntityCounts.Push(doorEntity);
+        g_aDoorEntityCounts.Push(1); // 初始计数为1
     }
     
     return !doorExists; // 返回是否是新添加的门
@@ -596,30 +604,30 @@ void AddRescuePointEntity(int rescueEntity)
     if (rescueEntity == -1) return;
     
     // 检查救援点是否已经在列表中
-    int index = g_RescuePoints.FindValue(rescueEntity);
+    int index = g_aRescuePoints.FindValue(rescueEntity);
     if (index == -1)
-        g_RescuePoints.Push(rescueEntity);
+        g_aRescuePoints.Push(rescueEntity);
 }
 
 // 获取门实体的关联次数
 int GetDoorCount(int doorEntity)
 {
-    for (int i = 0; i < g_DoorEntityCounts.Length; i += 2)
+    for (int i = 0; i < g_aDoorEntityCounts.Length; i += 2)
     {
-        if (g_DoorEntityCounts.Get(i) == doorEntity)
-            return g_DoorEntityCounts.Get(i + 1);
+        if (g_aDoorEntityCounts.Get(i) == doorEntity)
+            return g_aDoorEntityCounts.Get(i + 1);
     }
     return 0; // 未找到返回0
 }
 
 void ClearRescuePoints()
 {
-    for (int i = 0; i < g_RescuePoints.Length; i++)
+    for (int i = 0; i < g_aRescuePoints.Length; i++)
     {
-        int point = g_RescuePoints.Get(i);
+        int point = g_aRescuePoints.Get(i);
         RemoveEntityOutline(point);
     }
-    g_RescuePoints.Clear();
+    g_aRescuePoints.Clear();
 }
 
 void EndDoorBlink(int door)
@@ -638,16 +646,17 @@ void ClearAll()
 {
     if (g_hTimer != null)
     {
-        CloseHandle(g_hTimer);
+        if (IsValidHandle(g_hTimer))
+            delete g_hTimer;
         g_hTimer = null;
     }
-    for (int i = 0; i < g_BlinkingDoors.Length; i++)
+    for (int i = 0; i < g_aBlinkingDoors.Length; i++)
     {
-        EndDoorBlink(g_BlinkingDoors.Get(i));
+        EndDoorBlink(g_aBlinkingDoors.Get(i));
     }
     ClearDoorOutlines();
-    g_BlinkingDoors.Clear();
-    g_DoorEntityCounts.Clear();
+    g_aBlinkingDoors.Clear();
+    g_aDoorEntityCounts.Clear();
     ClearRescuePoints();
 }
 
@@ -666,7 +675,7 @@ bool CheckPosition(float pos[3], int navMask)
 
 public void Event_RoundStartPostNav(Event event, const char[] name, bool dontBroadcast)
 {
-    CreateTimer(3.0, Timer_RoundStart, _, _);
+    CreateTimer(3.0, Timer_RoundStart, _, TIMER_FLAG_NO_MAPCHANGE);
 }
 
 public Action Timer_RoundStart(Handle timer)
@@ -689,46 +698,40 @@ public Action Timer_RoundStart(Handle timer)
         if (find_entity != -1)
         {
             if (HasEntProp(find_entity, Prop_Send, "m_isRescueDoor") && GetEntProp(find_entity, Prop_Send, "m_isRescueDoor") == 1)
-            {
                 // 标准救援门
                 AddDoorWithCount(find_entity);
-            }
             else
-            {
                 // 不正确关联的门实体，直接添加救援点实体
                 AddRescuePointEntity(entity);
-            }
         }
         else
-        {
             // 没有找到任何类型的门
             AddRescuePointEntity(entity);
-        }
     }
     
     // 使用配置的闪烁速度
     float blinkSpeed = GetConVarFloat(g_hBlinkSpeed);
-    g_hTimer = CreateTimer(blinkSpeed, Timer_DoorBlink, _, TIMER_REPEAT);
+    g_hTimer = CreateTimer(blinkSpeed, Timer_DoorBlink, _, TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
 
-    for (int i = 0; i < g_RescuePoints.Length; i++)
-        CreateEntityOutline(g_RescuePoints.Get(i), 0, 255, 0); // 绿色轮廓
+    for (int i = 0; i < g_aRescuePoints.Length; i++)
+        CreateEntityOutline(g_aRescuePoints.Get(i), 0, 255, 0); // 绿色轮廓
 
     return Plugin_Continue;
 }
 
 public Action Timer_DoorBlink(Handle timer)
 {
-    if (g_BlinkColors.Length == 0)
+    if (g_aBlinkColors.Length == 0)
         return Plugin_Continue;
     
-    int colorCount = g_BlinkColors.Length / 3; // 每个颜色3个值(RGB)
+    int colorCount = g_aBlinkColors.Length / 3; // 每个颜色3个值(RGB)
     
-    for (int i = 0; i < g_BlinkingDoors.Length; i++)
+    for (int i = 0; i < g_aBlinkingDoors.Length; i++)
     {
-        int door = g_BlinkingDoors.Get(i);
+        int door = g_aBlinkingDoors.Get(i);
         if (!IsValidEntity(door))
         {
-            g_BlinkingDoors.Erase(i);
+            g_aBlinkingDoors.Erase(i);
             i--;
         }
         else
@@ -756,11 +759,11 @@ public Action Timer_DoorBlink(Handle timer)
                 int colorIndex = currentStep % colorCount; // 循环使用可用颜色
                 int arrayIndex = colorIndex * 3;
                 
-                if (arrayIndex + 2 < g_BlinkColors.Length)
+                if (arrayIndex + 2 < g_aBlinkColors.Length)
                 {
-                    r = g_BlinkColors.Get(arrayIndex);
-                    g = g_BlinkColors.Get(arrayIndex + 1);
-                    b = g_BlinkColors.Get(arrayIndex + 2);
+                    r = g_aBlinkColors.Get(arrayIndex);
+                    g = g_aBlinkColors.Get(arrayIndex + 1);
+                    b = g_aBlinkColors.Get(arrayIndex + 2);
                 }
                 else
                 {
@@ -788,13 +791,13 @@ public Action Timer_DoorBlink(Handle timer)
 
 public Action Timer_RescueNotification(Handle timer)
 {
-    CPrintToChatAll("{default}救援事件触发 本章节剩余复活门{lightgreen}%d{default}扇 剩余标记的救援点实体{lightgreen}%d{default}个", g_BlinkingDoors.Length, g_RescuePoints.Length);
+    CPrintToChatAll("{default}救援事件触发 本章节剩余复活门{lightgreen}%d{default}扇 剩余标记的救援点实体{lightgreen}%d{default}个", g_aBlinkingDoors.Length, g_aRescuePoints.Length);
     return Plugin_Continue;
 }
 
 public void Event_PlayerLeftSafeArea(Event event, const char[] name, bool dontBroadcast)
 {
-    CPrintToChatAll("{default}本章节共有复活门{lightgreen}%d{default}扇 救援点实体{lightgreen}%d{default}个 其中标记的救援点实体共有{lightgreen}%d{default}个", g_BlinkingDoors.Length, g_iTotalRescuePoints, g_RescuePoints.Length);
+    CPrintToChatAll("{default}本章节共有复活门{lightgreen}%d{default}扇 救援点实体{lightgreen}%d{default}个 其中标记的救援点实体共有{lightgreen}%d{default}个", g_aBlinkingDoors.Length, g_iTotalRescuePoints, g_aRescuePoints.Length);
 }
 
 public Action Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
@@ -823,7 +826,7 @@ public Action Event_PlayerDeath(Event event, const char[] name, bool dontBroadca
         int rescueTime = (rescuetimeCvar != null) ? rescuetimeCvar.IntValue : 60;
         
         CPrintToChatAll("{default}本章节剩余复活门{lightgreen}%d{default}扇 剩余标记的救援点实体{lightgreen}%d{default}个 救援等待时间{lightgreen}%d{default}秒", 
-                        g_BlinkingDoors.Length, g_RescuePoints.Length, rescueTime);
+                        g_aBlinkingDoors.Length, g_aRescuePoints.Length, rescueTime);
         
         g_fLastNotifyTime = currentTime;
     }
@@ -842,15 +845,15 @@ public void Event_RescueDoorOpen(Event event, const char[] name, bool dontBroadc
 
     if(!CheckPosition(pos, NAV_MESH_FINALE))
     {
-        int i = g_BlinkingDoors.FindValue(doorEntity);
+        int i = g_aBlinkingDoors.FindValue(doorEntity);
         if (i != -1)
         {
             EndDoorBlink(doorEntity);
             RemoveEntityOutline(doorEntity);
-            g_BlinkingDoors.Erase(i);
+            g_aBlinkingDoors.Erase(i);
         }
         float currentTime = GetGameTime();
-        CPrintToChatAll("{default}复活门已被开启 本章节剩余复活门{lightgreen}%d{default}扇 剩余标记的救援点实体{lightgreen}%d{default}个", g_BlinkingDoors.Length, g_RescuePoints.Length);
+        CPrintToChatAll("{default}复活门已被开启 本章节剩余复活门{lightgreen}%d{default}扇 剩余标记的救援点实体{lightgreen}%d{default}个", g_aBlinkingDoors.Length, g_aRescuePoints.Length);
         g_fLastNotifyTime = currentTime;
     }
 }
@@ -864,15 +867,15 @@ public Action Event_SurvivorRescued(Event event, const char[] name, bool dontBro
     int find_entity_rescue = FindNearestEntitybyName(victimClient, "info_survivor_rescue");
 
     RemoveEntityOutline(find_entity_rescue);
-    int rpIndex = g_RescuePoints.FindValue(find_entity_rescue);
+    int rpIndex = g_aRescuePoints.FindValue(find_entity_rescue);
     if (rpIndex != -1)
-        g_RescuePoints.Erase(rpIndex);
+        g_aRescuePoints.Erase(rpIndex);
 
     float currentTime = GetGameTime();
     if (FloatAbs(currentTime - g_fLastNotifyTime) >= 5.0)
     {
         // 延迟3秒执行通知
-        CreateTimer(3.0, Timer_RescueNotification, _, _);
+        CreateTimer(3.0, Timer_RescueNotification, _, TIMER_FLAG_NO_MAPCHANGE);
         g_fLastNotifyTime = currentTime;
     }
 
