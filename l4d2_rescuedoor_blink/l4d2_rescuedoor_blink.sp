@@ -1,9 +1,8 @@
 #include <sourcemod>
 #include <sdktools>
 #include <left4dhooks>
-#include <multicolors>
 #pragma newdecls required
-#define PLUGIN_VERSION "1.2.0"
+#define PLUGIN_VERSION "1.2.1"
 
 #define MAX_SEARCH_DIST 600   // 救援实体为圆心最大搜索距离
 
@@ -22,6 +21,13 @@ public Plugin myinfo =
 
 /*
 change log:
+v1.2.1
+    优化复活门搜索逻辑
+    优化提示信息
+    移除对<multicolors>的依赖
+    Optimized rescue door search logic
+    Improved notification messages
+    Removed dependency on <multicolors> (now using native chat color codes)
 v1.2.0
     重构大部分代码
     创建点光源效果改为穿透发光的圆形轮廓,不再处理funcdoor类型门,只处理prop_door_rotating和prop_door_rotating_checkpoint类型门
@@ -403,11 +409,12 @@ int FindNearestEntitybyName(int i, const char[] targetClassname)
 
 // 基于导航网格的“路径连通”检查（BFS，最多展开 maxDepth 层）
 // 只沿着具有 NAV_MESH_RESCUE_CLOSET 属性的导航区域进行扩展；
-// 若能在 maxDepth 内到达 doorPos 所在的导航区域，则视为连通。
+// 若能在 maxDepth 内到达 doorPos 所在的导航区域，则视为连通
+// doorPos所在区域本身可不含 NAV_MESH_RESCUE_CLOSET 属性。
 bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxDepth)
 {
-    Address startArea = L4D_GetNearestNavArea(vStartPos, 220.0, true, false, false, 0);
-    Address goalArea  = L4D_GetNearestNavArea(vGoalPos, 220.0, true, false, false, 0);
+    Address startArea = L4D_GetNearestNavArea(vStartPos, 220.0, false, true, false, 2);
+    Address goalArea  = L4D_GetNearestNavArea(vGoalPos, 220.0, false, true, false, 2);
 
     if (startArea == Address_Null || goalArea == Address_Null)
         return false;
@@ -431,23 +438,6 @@ bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxD
 
     int closetTotal = closetAreas.Length;
     if (closetTotal == 0)
-    {
-        delete areas;
-        delete closetAreas;
-        return false;
-    }
-
-    // 目标区域若不在预筛集合中，则无法通过“rescuecloset”的路径到达
-    bool goalAllowed = false;
-    for (int gi = 0; gi < closetTotal; gi++)
-    {
-        if (closetAreas.Get(gi) == goalArea)
-        {
-            goalAllowed = true;
-            break;
-        }
-    }
-    if (!goalAllowed)
     {
         delete areas;
         delete closetAreas;
@@ -481,6 +471,12 @@ bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxD
 
         if (depth >= maxDepth)
             continue;
+
+        if (L4D_NavArea_IsConnected(cur, goalArea, 4))
+        {
+            found = true;
+            break;
+        }
 
         // 只在预筛后的 closetAreas 集合内寻找邻接候选
         for (int i = 0; i < closetTotal; i++)
@@ -696,16 +692,9 @@ public Action Timer_RoundStart(Handle timer)
         GetEntPropVector(entity, Prop_Data, "m_vecOrigin", origin);
         find_entity = FindRescueDoorEntity(entity);
         if (find_entity != -1)
-        {
-            if (HasEntProp(find_entity, Prop_Send, "m_isRescueDoor") && GetEntProp(find_entity, Prop_Send, "m_isRescueDoor") == 1)
-                // 标准救援门
-                AddDoorWithCount(find_entity);
-            else
-                // 不正确关联的门实体，直接添加救援点实体
-                AddRescuePointEntity(entity);
-        }
+            AddDoorWithCount(find_entity);
         else
-            // 没有找到任何类型的门
+            // 没有找到任何类型的门或关联到非标准救援门
             AddRescuePointEntity(entity);
     }
     
@@ -791,13 +780,13 @@ public Action Timer_DoorBlink(Handle timer)
 
 public Action Timer_RescueNotification(Handle timer)
 {
-    CPrintToChatAll("{default}救援事件触发 本章节剩余复活门{lightgreen}%d{default}扇 剩余标记的救援点实体{lightgreen}%d{default}个", g_aBlinkingDoors.Length, g_aRescuePoints.Length);
+    PrintToChatAll("\x01救援事件触发 本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_aRescuePoints.Length);
     return Plugin_Continue;
 }
 
 public void Event_PlayerLeftSafeArea(Event event, const char[] name, bool dontBroadcast)
 {
-    CPrintToChatAll("{default}本章节共有复活门{lightgreen}%d{default}扇 救援点实体{lightgreen}%d{default}个 其中标记的救援点实体共有{lightgreen}%d{default}个", g_aBlinkingDoors.Length, g_iTotalRescuePoints, g_aRescuePoints.Length);
+    PrintToChatAll("\x01本章节共有复活门\x03%d\x01扇 \x01救援点实体\x03%d\x01个 \x01其中标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_iTotalRescuePoints, g_aRescuePoints.Length);
 }
 
 public Action Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
@@ -825,8 +814,8 @@ public Action Event_PlayerDeath(Event event, const char[] name, bool dontBroadca
         ConVar rescuetimeCvar = FindConVar("rescue_min_dead_time");
         int rescueTime = (rescuetimeCvar != null) ? rescuetimeCvar.IntValue : 60;
         
-        CPrintToChatAll("{default}本章节剩余复活门{lightgreen}%d{default}扇 剩余标记的救援点实体{lightgreen}%d{default}个 救援等待时间{lightgreen}%d{default}秒", 
-                        g_aBlinkingDoors.Length, g_aRescuePoints.Length, rescueTime);
+        PrintToChatAll("\x01本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个 \x01救援等待时间\x03%d\x01秒", 
+            g_aBlinkingDoors.Length, g_aRescuePoints.Length, rescueTime);
         
         g_fLastNotifyTime = currentTime;
     }
@@ -853,7 +842,7 @@ public void Event_RescueDoorOpen(Event event, const char[] name, bool dontBroadc
             g_aBlinkingDoors.Erase(i);
         }
         float currentTime = GetGameTime();
-        CPrintToChatAll("{default}复活门已被开启 本章节剩余复活门{lightgreen}%d{default}扇 剩余标记的救援点实体{lightgreen}%d{default}个", g_aBlinkingDoors.Length, g_aRescuePoints.Length);
+        PrintToChatAll("\x01复活门已被开启 \x01本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_aRescuePoints.Length);
         g_fLastNotifyTime = currentTime;
     }
 }
@@ -891,5 +880,5 @@ public void Event_FinaleStart(Event event, const char[] name, bool dontBroadcast
 {
     ClearAll();
     
-    CPrintToChatAll("{default}章节救援开始！所有复活门及救援实体已{lightgreen}失效");
+    PrintToChatAll("\x01章节救援开始！所有复活门及救援实体已\x03失效");
 }
