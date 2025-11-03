@@ -2,7 +2,7 @@
 #include <sdktools>
 #include <left4dhooks>
 #pragma newdecls required
-#define PLUGIN_VERSION "1.2.1"
+#define PLUGIN_VERSION "1.2.2"
 
 #define MAX_SEARCH_DIST 600   // 救援实体为圆心最大搜索距离
 
@@ -21,6 +21,9 @@ public Plugin myinfo =
 
 /*
 change log:
+v1.2.2
+    优化复活门搜索逻辑
+    Optimized rescue door search logic
 v1.2.1
     优化复活门搜索逻辑
     优化提示信息
@@ -57,12 +60,6 @@ int
     g_iTotalRescuePoints;    // 本章节救援点总数
 float
     g_fLastNotifyTime;
-
-// 门类型数组
-char g_DoorTypes[][64] = {
-    "prop_door_rotating",
-    "prop_door_rotating_checkpoint"
-};
 
 ArrayList
     g_aBlinkingDoors,
@@ -197,24 +194,6 @@ public void OnBlinkSpeedChanged(ConVar convar, const char[] oldValue, const char
     }
 }
 
-// 检查实体是否为符合要求的门类型
-bool CheckEntitybyName(int entity)
-{
-    if (!IsValidEntity(entity))
-        return false;
-    
-    char classname[64];
-    GetEntityClassname(entity, classname, sizeof(classname));
-    
-    for (int i = 0; i < sizeof(g_DoorTypes); i++)
-    {
-        if (StrEqual(classname, g_DoorTypes[i]))
-            return true;
-    }
-    
-    return false;
-}
-
 // 判断实体是否是救援门
 bool IsRescueDoor(int entity)
 {
@@ -224,25 +203,12 @@ bool IsRescueDoor(int entity)
 // 安全地设置实体颜色和渲染模式
 void SafeSetEntityColor(int entity, int r, int g, int b, int a)
 {
-    if (!CheckEntitybyName(entity))
+    if (!HasEntProp(entity, Prop_Send, "m_isRescueDoor"))
         return;
-        
-    // 检查实体是否支持渲染属性
-    if (!HasEntProp(entity, Prop_Send, "m_nRenderMode"))
-        return;
-    
-    // 先设置渲染模式，确保颜色能正确显示
-    SetEntProp(entity, Prop_Send, "m_nRenderMode", 1); // kRenderTransColor
-    
-    // 安全地设置颜色
+
     if (HasEntProp(entity, Prop_Send, "m_clrRender"))
         SetEntityRenderColor(entity, r, g, b, a);
     
-    // 确保实体可见
-    if (HasEntProp(entity, Prop_Send, "m_fEffects"))
-        SetEntProp(entity, Prop_Send, "m_fEffects", GetEntProp(entity, Prop_Send, "m_fEffects") & ~32); // 移除EF_NODRAW
-    
-    // 为门实体创建轮廓效果
     CreateEntityOutline(entity, r, g, b);
 }
 
@@ -368,53 +334,14 @@ Action Hook_SetTransmit_Outline(int entity, int client)
     return Plugin_Continue;
 }
 
-int FindNearestEntitybyName(int i, const char[] targetClassname)
-{
-    // 获取参考实体的位置
-    float refPos[3];
-    if (i >= 1 && i <= MaxClients)
-        GetClientAbsOrigin(i, refPos);
-    else
-        GetEntPropVector(i, Prop_Send, "m_vecOrigin", refPos);
-
-    int nearestEntity = -1;
-    float minDistance = -1.0;
-
-    // 遍历所有实体
-    int entity = -1;
-    while ((entity = FindEntityByClassname(entity, targetClassname)) != -1)
-    {
-        if (entity == i) continue;
-        
-        // 获取目标实体位置
-        float targetPos[3];
-        GetEntPropVector(entity, Prop_Send, "m_vecOrigin", targetPos);
-        
-        // 计算距离
-        float distance = GetVectorDistance(refPos, targetPos);
-
-        // 跳过过远的实体
-        if (distance > MAX_SEARCH_DIST) continue;
-        
-        // 更新最近实体
-        if (minDistance < 0 || distance < minDistance)
-        {
-            minDistance = distance;
-            nearestEntity = entity;
-        }
-    }
-    
-    return nearestEntity; // 返回最近的实体ID，未找到返回-1
-}
-
 // 基于导航网格的“路径连通”检查（BFS，最多展开 maxDepth 层）
 // 只沿着具有 NAV_MESH_RESCUE_CLOSET 属性的导航区域进行扩展；
-// 若能在 maxDepth 内到达 doorPos 所在的导航区域，则视为连通
-// doorPos所在区域本身可不含 NAV_MESH_RESCUE_CLOSET 属性。
+// 若能在 maxDepth 内到达目标所在的导航区域，则视为连通
+// 起点和终点导航网格可不含 NAV_MESH_RESCUE_CLOSET 属性。
 bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxDepth)
 {
-    Address startArea = L4D_GetNearestNavArea(vStartPos, 220.0, false, true, false, 2);
-    Address goalArea  = L4D_GetNearestNavArea(vGoalPos, 220.0, false, true, false, 2);
+    Address startArea = L4D_GetNearestNavArea(vStartPos, 300.0, true, false, false, 0);
+    Address goalArea  = L4D_GetNearestNavArea(vGoalPos, 300.0, true, false, false, 0);
 
     if (startArea == Address_Null || goalArea == Address_Null)
         return false;
@@ -508,67 +435,127 @@ bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxD
     return found;
 }
 
-int FindRescueDoorEntity(int referenceEntity)
+// 从 rescues 中选择并标记距离 doorPos 最近的最多 maxPick 个救援点（在 MAX_SEARCH_DIST 内），返回成功标记的数量
+int MarkNearestRescueWithinRange(float doorPos[3], float searchRadius, ArrayList rescues, ArrayList markLeft, int maxPick, bool checkConnected)
 {
-    // 目标：在以 refPos 为圆心、MAX_SEARCH_DIST 为半径内，
-    // 查找最近的符合要求的门（标准救援门），并且其导航区域与 refPos 以rescuecloset路径连通；
-    // 若最近者不连通，则继续找次近者，最终返回最近的“连通的救援门”；若没有则返回 -1。
-    if (!IsValidEntity(referenceEntity)) return -1;
+    if (maxPick < 1)
+        return 0;
 
-    float refPos[3];
-    GetEntPropVector(referenceEntity, Prop_Send, "m_vecOrigin", refPos);
+    if (maxPick > 3)
+        maxPick = 3; // 最多只统计3个
 
-    int bestDoor = -1;
-    float bestDist = -1.0;
+    int count = 0;
 
-    for (int i = 0; i < sizeof(g_DoorTypes); i++)
+    int topIdx[3];
+    float topDist[3];
+    for (int k = 0; k < 3; k++)
     {
-        int ent = -1;
-        while ((ent = FindEntityByClassname(ent, g_DoorTypes[i])) != -1)
+        topIdx[k] = -1;
+        topDist[k] = -1.0;
+    }
+
+    for (int i = 0; i < rescues.Length; i++)
+    {
+        if (markLeft.Get(i) == 0)
+            continue;
+
+        int rp = rescues.Get(i);
+
+        float rpPos[3];
+        GetEntPropVector(rp, Prop_Data, "m_vecOrigin", rpPos);
+        float dist = GetVectorDistance(doorPos, rpPos);
+        if (dist > searchRadius)
+            continue;
+
+        //路径连通性检查
+        if (checkConnected && !IsPathConnectedRescueCloset(doorPos, rpPos, 10))
+            continue;
+
+        // 插入有序队列（按距离升序，容量 maxPick）
+        int slot = -1;
+        for (int p = 0; p < maxPick; p++)
         {
-            if (ent == referenceEntity || !IsValidEntity(ent))
-                continue;
-
-            if(!IsRescueDoor(ent))
-                continue;
-
-            float doorPos[3];
-            GetEntPropVector(ent, Prop_Send, "m_vecOrigin", doorPos);
-
-            float distance = GetVectorDistance(refPos, doorPos);
-            if (distance > float(MAX_SEARCH_DIST))
-                continue;
-
-            // 判断“路径连通”（BFS，最多10层）
-            // 仅沿含 NAV_MESH_RESCUE_CLOSET 属性的导航区域进行扩展
-            if (!IsPathConnectedRescueCloset(refPos, doorPos, 10))
-                continue;
-
-            if (bestDist < 0.0 || distance < bestDist)
+            if (topDist[p] < 0.0 || dist < topDist[p])
             {
-                bestDist = distance;
-                bestDoor = ent;
+                slot = p;
+                break;
             }
+        }
+
+        if (slot != -1)
+        {
+            for (int k = maxPick - 1; k > slot; k--)
+            {
+                topDist[k] = topDist[k - 1];
+                topIdx[k] = topIdx[k - 1];
+            }
+            topDist[slot] = dist;
+            topIdx[slot] = i;
         }
     }
 
-    return bestDoor;
+    // 标记最近的 maxPick 个救援点
+    for (int p = 0; p < maxPick; p++)
+    {
+        if (topIdx[p] != -1)
+        {
+            markLeft.Set(topIdx[p], 0);
+            count++;
+        }
+    }
+
+    if(count == 0)
+        //扩大搜索距离，取消连通性检查，直到找到为止
+        count = MarkNearestRescueWithinRange(doorPos, 2 * searchRadius, rescues, markLeft, maxPick, false);
+
+    return count;
 }
 
-// 添加门实体到闪烁列表，并记录关联次数
-bool AddDoorWithCount(int doorEntity)
+int FindNearestEntitybyName(int i, const char[] targetClassname)
 {
-    if (doorEntity == -1) return false;
+    float refPos[3];
+    if (i >= 1 && i <= MaxClients)
+        GetClientAbsOrigin(i, refPos);
+    else
+        GetEntPropVector(i, Prop_Send, "m_vecOrigin", refPos);
+
+    int nearestEntity = -1;
+    float minDistance = -1.0;
+
+    int entity = -1;
+    while ((entity = FindEntityByClassname(entity, targetClassname)) != -1)
+    {
+        if (entity == i) continue;
+        
+        float targetPos[3];
+        GetEntPropVector(entity, Prop_Send, "m_vecOrigin", targetPos);
+        
+        float distance = GetVectorDistance(refPos, targetPos);
+
+        if (distance > MAX_SEARCH_DIST) continue;
+        
+        if (minDistance < 0 || distance < minDistance)
+        {
+            minDistance = distance;
+            nearestEntity = entity;
+        }
+    }
     
-    // 检查门是否已经在闪烁列表中
+    return nearestEntity;
+}
+
+// 直接设置门实体的关联计数；若门不在列表中则添加
+void SetDoorCount(int doorEntity, int count)
+{
+    if (doorEntity == -1)
+        return;
+
+    // 确保门在闪烁列表中
     int doorIndex = g_aBlinkingDoors.FindValue(doorEntity);
-    bool doorExists = (doorIndex != -1);
-    
-    // 如果门不在闪烁列表中，添加它
-    if (!doorExists)
+    if (doorIndex == -1)
         g_aBlinkingDoors.Push(doorEntity);
-    
-    // 查找门实体在计数数组中的位置
+
+    // 在计数数组中查找并设置对应计数
     int countIndex = -1;
     for (int i = 0; i < g_aDoorEntityCounts.Length; i += 2)
     {
@@ -578,21 +565,14 @@ bool AddDoorWithCount(int doorEntity)
             break;
         }
     }
-    
+
     if (countIndex != -1)
-    {
-        // 门实体已存在，增加计数
-        int doorCurrentCount = g_aDoorEntityCounts.Get(countIndex + 1);
-        g_aDoorEntityCounts.Set(countIndex + 1, doorCurrentCount + 1);
-    }
+        g_aDoorEntityCounts.Set(countIndex + 1, count);
     else
     {
-        // 门实体不存在，添加新记录
         g_aDoorEntityCounts.Push(doorEntity);
-        g_aDoorEntityCounts.Push(1); // 初始计数为1
+        g_aDoorEntityCounts.Push(count);
     }
-    
-    return !doorExists; // 返回是否是新添加的门
 }
 
 void AddRescuePointEntity(int rescueEntity)
@@ -628,14 +608,14 @@ void ClearRescuePoints()
 
 void EndDoorBlink(int door)
 {
-    if (!CheckEntitybyName(door))
+    if (!IsValidEntity(door))
+        return;
+
+    if (!HasEntProp(door, Prop_Send, "m_isRescueDoor"))
         return;
 
     if (HasEntProp(door, Prop_Send, "m_clrRender"))
         SetEntityRenderColor(door, 255, 255, 255, 255);
-
-    if (HasEntProp(door, Prop_Send, "m_nRenderMode"))
-        SetEntProp(door, Prop_Send, "m_nRenderMode", 0); // kRenderNormal
 }
 
 void ClearAll()
@@ -647,9 +627,8 @@ void ClearAll()
         g_hTimer = null;
     }
     for (int i = 0; i < g_aBlinkingDoors.Length; i++)
-    {
         EndDoorBlink(g_aBlinkingDoors.Get(i));
-    }
+
     ClearDoorOutlines();
     g_aBlinkingDoors.Clear();
     g_aDoorEntityCounts.Clear();
@@ -665,7 +644,6 @@ bool CheckPosition(float pos[3], int navMask)
 
     int attributes = L4D_GetNavArea_SpawnAttributes(area);
 
-    // 是否包含指定的导航属性
     return (attributes & navMask) != 0;
 }
 
@@ -678,26 +656,62 @@ public Action Timer_RoundStart(Handle timer)
 {
     g_iCurrentCount = 0;
     g_iTotalRescuePoints = 0;  // 重置救援点计数
-    
+
     ClearAll();
 
-    int entity = -1;
-    int find_entity = -1;
-    float origin[3];
-    
-    // 统计info_survivor_rescue实体总数
-    while ((entity = FindEntityByClassname(entity, "info_survivor_rescue")) != -1)
+    // Step 1: 遍历所有 info_survivor_rescue，记录并标记为“待处理(1)”
+    ArrayList rescues = new ArrayList();      // 存实体ID
+    ArrayList markLeft = new ArrayList();     // 1=未被任何门统计, 0=已被某门统计
+    int ent = -1;
+    while ((ent = FindEntityByClassname(ent, "info_survivor_rescue")) != -1)
     {
-        g_iTotalRescuePoints++;
-        GetEntPropVector(entity, Prop_Data, "m_vecOrigin", origin);
-        find_entity = FindRescueDoorEntity(entity);
-        if (find_entity != -1)
-            AddDoorWithCount(find_entity);
-        else
-            // 没有找到任何类型的门或关联到非标准救援门
-            AddRescuePointEntity(entity);
+        rescues.Push(ent);
+        markLeft.Push(1);
     }
-    
+    g_iTotalRescuePoints = rescues.Length;
+
+    // Step 2: 遍历所有实体，筛选标准救援门范围内救援点
+    int maxEnts = GetMaxEntities();
+    for (int door = MaxClients + 1; door < maxEnts; door++)
+    {
+        if (!IsValidEntity(door))
+            continue;
+
+        if (!IsRescueDoor(door))
+            continue;
+
+        int count = 0;
+
+        float doorPos[3];
+        GetEntPropVector(door, Prop_Send, "m_vecOrigin", doorPos);
+
+        // 检查门模型：若为“models/props_urban/outhouse_door001.mdl”，仅统计最近的一个救援点
+        bool bNearestOnly = false;
+        char modelName[PLATFORM_MAX_PATH];
+        if (GetEntPropString(door, Prop_Data, "m_ModelName", modelName, sizeof(modelName)))
+        {
+            if (StrEqual(modelName, "models/props_urban/outhouse_door001.mdl", false))
+                bNearestOnly = true;
+        }
+
+        count = MarkNearestRescueWithinRange(doorPos, float(MAX_SEARCH_DIST), rescues, markLeft, bNearestOnly ? 1 : 3, true);
+
+        SetDoorCount(door, count);
+    }
+
+    // Step 3: 添加未被任何门处理的救援点标记
+    for (int i = 0; i < rescues.Length; i++)
+    {
+        if (markLeft.Get(i) == 1)
+        {
+            int rp = rescues.Get(i);
+            AddRescuePointEntity(rp);
+        }
+    }
+
+    delete rescues;
+    delete markLeft;
+
     // 使用配置的闪烁速度
     float blinkSpeed = GetConVarFloat(g_hBlinkSpeed);
     g_hTimer = CreateTimer(blinkSpeed, Timer_DoorBlink, _, TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
@@ -725,10 +739,6 @@ public Action Timer_DoorBlink(Handle timer)
         }
         else
         {
-            // 获取实体类名，确保只对指定的门类型进行闪烁
-            if (!CheckEntitybyName(door))
-                continue;
-            
             // 获取门的计数，决定闪烁模式
             int doorCount = GetDoorCount(door);
             if (doorCount <= 0) continue; // 如果计数为0或无效，跳过
