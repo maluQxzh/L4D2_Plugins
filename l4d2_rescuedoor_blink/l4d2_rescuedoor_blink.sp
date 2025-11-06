@@ -2,12 +2,16 @@
 #include <sdktools>
 #include <left4dhooks>
 #pragma newdecls required
-#define PLUGIN_VERSION "1.2.2"
+#define PLUGIN_VERSION "1.3.0"
 
 #define MAX_SEARCH_DIST 600   // 救援实体为圆心最大搜索距离
 
 #define NAV_MESH_FINALE 64
 #define NAV_MESH_RESCUE_CLOSET 65536
+#define NAV_SPAWN_DESTROYED_DOOR 262144
+
+// 默认用于 info_survivor_rescue 轮廓的模型
+#define DEFAULT_RESCUE_MODEL "models/props_unique/airport/atlas_break_ball.mdl"
 
 
 public Plugin myinfo = 
@@ -21,6 +25,15 @@ public Plugin myinfo =
 
 /*
 change log:
+v1.3.0
+    优化复活门搜索逻辑
+    新增排除假救援点，现在假救援点不再进行任何标记
+    新增针对标记救援点的复活提示，当有玩家处于影响死亡玩家复活的救援点范围内时，会收到提示信息
+    新增一系列ConVar配置
+    Optimized rescue door search logic
+    Added exclusion for fake rescue points, which are no longer marked
+    Added rescue notification for marked rescue points, players within the range of rescue points affecting dead player revival will receive notification messages
+    Added a series of ConVar configurations
 v1.2.2
     优化复活门搜索逻辑
     Optimized rescue door search logic
@@ -33,7 +46,7 @@ v1.2.1
     Removed dependency on <multicolors> (now using native chat color codes)
 v1.2.0
     重构大部分代码
-    创建点光源效果改为穿透发光的圆形轮廓,不再处理funcdoor类型门,只处理prop_door_rotating和prop_door_rotating_checkpoint类型门
+    创建点光源效果改为穿透发光的圆形轮廓，不再处理funcdoor类型门，只处理prop_door_rotating和prop_door_rotating_checkpoint类型门
     搜索复活点实体周围的救援门时,增加了对门与复活点之间以rescuecloset网格属性的连通性的检查
     Refactored most of the code
     Changed light source effects to glowing circular outlines, no longer processing func_door type doors, only handling prop_door_rotating and prop_door_rotating_checkpoint type doors
@@ -55,6 +68,32 @@ v1.0.0
 	Initial Release
 */
 
+/*
+游戏中复活机制详解：
+
+    救援实体知识：
+    1.每个复活点实体可以复活一位玩家，复活点实体失效条件：
+        a. 当前复活点实体复活了一位玩家
+        b. 复活点所关联的复活门被开启
+    
+    游戏中的标记复活门的逻辑：
+    1.以当前复活点实体为中心所在导航区域向外扩展（单向连通即可）一定距离（具体未知），将相应导航区域标记为“NAV_MESH_RESCUE_CLOSET”，当扩展到含有“NAV_SPAWN_DESTROYED_DOOR”属性的导航区域时停止扩展，并将该区域内的门标记为复活门（"m_isRescueDoor"=1）
+        若同时遇到多个含有“NAV_SPAWN_DESTROYED_DOOR”属性的导航区域，则同时将该区域内的门标记为复活门，即救援点实体关联了多个复活门
+    2.若上述操作在扩展到最大距离时仍没有遇到含有“NAV_SPAWN_DESTROYED_DOOR”属性的导航区域，则该复活点实体不关联任何复活门
+
+    一些疑问：
+    无效的救援实体是怎么产生的的？（游戏中有些救援实体无法复活玩家）
+        从外侧的导航区域（非“NAV_MESH_RESCUE_CLOSET”）出发，无法连通到该救援实体所在的导航区域，被判定为不可达（无法进入救援玩家）
+    超过了救援等待时间，为什么救援点还是无法复活玩家？
+        有玩家处于该救援点实体扩展出的“NAV_MESH_RESCUE_CLOSET”区域内，阻止了该救援点的生成待复活玩家的呼救（表现为不复活）
+
+    ！！！以上信息无游戏源码支撑，仅是本人通过观察实际游戏行为和导航网格属性推测并验证得出，仅供参考。如果各位有更准确的信息或新的结论，欢迎交流
+
+    结论：
+    1. 若救援点实体关联到复活门，插件会用颜色标记该复活门，同时用颜色数量提示被关联的救援点实体的个数，当复活门开启时，被关联的救援点不管是否已经复活玩家都会失效
+    2. 若救援点实体未关联到任何复活门，则该救援点实体会被插件标记，每个被标记的救援点都可以复活一位玩家
+*/
+
 int
     g_iCurrentCount,
     g_iTotalRescuePoints;    // 本章节救援点总数
@@ -69,10 +108,21 @@ ArrayList
 // 轮廓系统变量
 int g_iOutlineIndex[2048] = {0};  // 存储每个实体对应的轮廓实体引用
 Handle
-    g_hTimer = null;
+    g_hTimer = null,
+    g_hRescueStartTimer[MAXPLAYERS + 1],
+    g_hRescueRepeatTimer[MAXPLAYERS + 1];
 ConVar
     g_hBlinkSpeed,    // 闪烁速度（间隔时间）
-    g_hBlinkColors;   // 颜色字符串（RGB值）
+    g_hBlinkColors,   // 颜色字符串（RGB值）
+    g_hOutlineGlowRange, // 轮廓发光可见范围（默认500）
+    g_hRescueModelPath, // 自定义 info_survivor_rescue 的模型路径
+    g_hRescuePointColor, // 标记救援点轮廓颜色（R,G,B）
+    g_hRescueScalePercent, // info_survivor_rescue 轮廓模型缩放百分比
+    g_hRescueZOffset;   // info_survivor_rescue 轮廓模型的Z轴下移偏移量
+    
+
+char g_sRescueModel[PLATFORM_MAX_PATH]; // 实际使用的模型路径
+int g_iRescueColor[3] = {0, 255, 0}; // 标记救援点轮廓默认颜色（绿色）
 
 public void OnPluginStart()
 {
@@ -85,7 +135,45 @@ public void OnPluginStart()
 
     // 创建配置变量
     g_hBlinkSpeed = CreateConVar("l4d2_rescuedoor_blink_speed", "1.0", "闪烁间隔时间（秒）Blink interval time (seconds)", FCVAR_NOTIFY, true, 0.1, true, 10.0);
-    g_hBlinkColors = CreateConVar("l4d2_rescuedoor_blink_colors", "255,0,0;255,255,0;0,255,0", "闪烁颜色列表(R,G,B格式，用分号分隔，共九个值) Blink colors list (R,G,B format, separated by semicolon, 9 values total)", FCVAR_NOTIFY);
+    g_hBlinkColors = CreateConVar("l4d2_rescuedoor_blink_colors",
+        "255,0,0;255,255,0;0,255,0",
+        "闪烁颜色列表(R,G,B格式，用分号分隔，共九个值) Blink colors list (R,G,B format, separated by semicolon, 9 values total)",
+        FCVAR_NOTIFY
+    );
+    g_hOutlineGlowRange = CreateConVar(
+        "l4d2_rescuedoor_blink_glow_range",
+        "500",
+        "轮廓发光可见范围（单位：Hammer单位）",
+        FCVAR_NOTIFY,
+        true, 100.0,
+        true, 3000.0
+    );
+    g_hRescueModelPath = CreateConVar(
+        "l4d2_rescuedoor_blink_rescue_model",
+        "models/props_unique/airport/atlas_break_ball.mdl",
+        "用于标记救援点所使用的模型路径（留空或无效将使用默认）",
+        FCVAR_NOTIFY
+    );
+    g_hRescuePointColor = CreateConVar(
+        "l4d2_rescuedoor_blink_rescue_color",
+        "0,255,0",
+        "用于标记救援点所使用的模型的外轮廓颜色（R,G,B）",
+        FCVAR_NOTIFY
+    );
+    g_hRescueScalePercent = CreateConVar(
+        "l4d2_rescuedoor_blink_rescue_scale_percent",
+        "15",
+        "用于标记救援点所使用的模型缩放百分比（1-300）",
+        FCVAR_NOTIFY,
+        true, 1.0,
+        true, 300.0
+    );
+    g_hRescueZOffset = CreateConVar(
+        "l4d2_rescuedoor_blink_rescue_zoffset",
+        "-20.0",
+        "用于标记救援点所使用的模型的Z轴移偏移量（单位：Hammer单位；正值为上移）",
+        FCVAR_NOTIFY
+    );
 
     AutoExecConfig(true, "l4d2_rescuedoor_blink");
 
@@ -97,6 +185,8 @@ public void OnPluginStart()
 
     // 初始化颜色配置
     UpdateBlinkColors();
+    // 初始化救援点外轮廓颜色（R,G,B），避免首图未读到
+    UpdateRescuePointColor();
     
     // 当配置变量改变时更新颜色配置
     HookConVarChange(g_hBlinkColors, OnColorCvarChanged);
@@ -115,10 +205,32 @@ public void OnPluginStart()
     HookEvent("finale_vehicle_leaving", Event_RoundEnd);//救援载具离开之时  (没有触发round_end)
 }
 
-// 预缓存自定义用于轮廓的模型，避免出现 "late precache of models/...atlas_break_ball.mdl" 提示
+// 预缓存用于轮廓的模型，优先使用 ConVar 配置，失败则使用默认，避免 late precache 提示
 public void OnMapStart()
 {
-    PrecacheModel("models/props_unique/airport/atlas_break_ball.mdl", true);
+    // 先设置默认
+    strcopy(g_sRescueModel, sizeof(g_sRescueModel), DEFAULT_RESCUE_MODEL);
+
+    char cfgPath[PLATFORM_MAX_PATH];
+    if (g_hRescueModelPath != null)
+        GetConVarString(g_hRescueModelPath, cfgPath, sizeof(cfgPath));
+    else
+        cfgPath[0] = '\0';
+
+    // 如果配置不为空，尝试预缓存自定义模型
+    if (cfgPath[0] != '\0')
+    {
+        int idx = PrecacheModel(cfgPath, true);
+        if (idx > 0)
+            strcopy(g_sRescueModel, sizeof(g_sRescueModel), cfgPath);
+        else
+        {
+            PrecacheModel(DEFAULT_RESCUE_MODEL, true);
+            strcopy(g_sRescueModel, sizeof(g_sRescueModel), DEFAULT_RESCUE_MODEL);
+        }
+    }
+    else
+        PrecacheModel(DEFAULT_RESCUE_MODEL, true);
 }
 
 // 解析颜色配置字符串
@@ -171,6 +283,39 @@ void UpdateBlinkColors()
     g_aBlinkColors.Push(255);
     g_aBlinkColors.Push(255);
     g_aBlinkColors.Push(255);
+    }
+}
+
+// 解析用于标记救援点的外轮廓颜色（R,G,B）到 g_iRescueColor
+void UpdateRescuePointColor()
+{
+    // 默认绿色
+    g_iRescueColor[0] = 0;
+    g_iRescueColor[1] = 255;
+    g_iRescueColor[2] = 0;
+
+    if (g_hRescuePointColor == null)
+        return;
+
+    char colorStr[64];
+    GetConVarString(g_hRescuePointColor, colorStr, sizeof(colorStr));
+
+    char parts[3][16];
+    int cnt = ExplodeString(colorStr, ",", parts, sizeof(parts), sizeof(parts[]));
+    if (cnt == 3)
+    {
+        int r = StringToInt(parts[0]);
+        int g = StringToInt(parts[1]);
+        int b = StringToInt(parts[2]);
+
+        // clamp 0-255
+        r = (r < 0) ? 0 : ((r > 255) ? 255 : r);
+        g = (g < 0) ? 0 : ((g > 255) ? 255 : g);
+        b = (b < 0) ? 0 : ((b > 255) ? 255 : b);
+
+        g_iRescueColor[0] = r;
+        g_iRescueColor[1] = g;
+        g_iRescueColor[2] = b;
     }
 }
 
@@ -233,9 +378,9 @@ void CreateEntityOutline(int entity, int r, int g, int b)
     char entityClassname[64];
     GetEntityClassname(entity, entityClassname, sizeof(entityClassname));
 
-    // 特殊处理救援点实体
+    // 特殊处理救援点实体：优先使用配置/预缓存成功的模型
     if (StrEqual(entityClassname, "info_survivor_rescue"))
-        strcopy(modelName, sizeof(modelName), "models/props_unique/airport/atlas_break_ball.mdl");
+        strcopy(modelName, sizeof(modelName), g_sRescueModel[0] ? g_sRescueModel : DEFAULT_RESCUE_MODEL);
     else
     {
         // 其他实体正常获取模型
@@ -252,36 +397,48 @@ void CreateEntityOutline(int entity, int r, int g, int b)
     
     DispatchSpawn(outlineEntity);
 
-    // 如果是info_survivor_rescue实体，在生成后设置模型缩放
+    // 如果是info_survivor_rescue实体，在生成后设置模型缩放（由百分比ConVar控制）
     if (StrEqual(entityClassname, "info_survivor_rescue"))
-        SetEntPropFloat(outlineEntity, Prop_Send, "m_flModelScale", 0.15); // 缩放为15%大小
+    {
+        float fScale = 0.15; // 默认15%
+        if (g_hRescueScalePercent != null)
+        {
+            int p = GetConVarInt(g_hRescueScalePercent);
+            if (p < 1) p = 1;
+            if (p > 300) p = 300;
+            fScale = float(p) / 100.0;
+        }
+        SetEntPropFloat(outlineEntity, Prop_Send, "m_flModelScale", fScale);
+    }
     
     // 获取原实体的位置和角度
     float pos[3], angles[3];
     GetEntPropVector(entity, Prop_Send, "m_vecOrigin", pos);
     GetEntPropVector(entity, Prop_Send, "m_angRotation", angles);
 
-    // 如果是info_survivor_rescue实体，调整Z轴坐标下移20个单位
+    // 如果是info_survivor_rescue实体，按配置调整Z轴坐标下移（默认20.0）
     if (StrEqual(entityClassname, "info_survivor_rescue"))
-        pos[2] -= 20.0; // Z轴坐标下移20个单位
-    
+    {
+        float g_fRescueZOffset = g_hRescueZOffset != null ? GetConVarFloat(g_hRescueZOffset) : -20.0;
+        pos[2] += g_fRescueZOffset;
+    }
+
     TeleportEntity(outlineEntity, pos, angles, NULL_VECTOR);
     
     // 设置轮廓发光属性
     SetEntProp(outlineEntity, Prop_Send, "m_CollisionGroup", 0);
     SetEntProp(outlineEntity, Prop_Send, "m_nSolidType", 0);
-    SetEntProp(outlineEntity, Prop_Send, "m_nGlowRange", 500);
+    int iGlowRange = (g_hOutlineGlowRange != null) ? GetConVarInt(g_hOutlineGlowRange) : 500;
+    SetEntProp(outlineEntity, Prop_Send, "m_nGlowRange", iGlowRange);
     SetEntProp(outlineEntity, Prop_Send, "m_iGlowType", 3);
     
     // 计算轮廓颜色值 (RGB转换为单个整数)
     int glowColor = r + (g * 256) + (b * 65536);
     SetEntProp(outlineEntity, Prop_Send, "m_glowColorOverride", glowColor);
     AcceptEntityInput(outlineEntity, "StartGlowing");
-    
-    // 设置轮廓实体不可见（只显示发光效果）
+
+    // 设置轮廓实体渲染模式与可见性（默认隐藏模型，仅显示发光外轮廓）
     SetEntityRenderMode(outlineEntity, RENDER_TRANSCOLOR);
-    
-    // 安全地设置轮廓实体颜色
     if (HasEntProp(outlineEntity, Prop_Send, "m_clrRender"))
         SetEntityRenderColor(outlineEntity, 0, 0, 0, 0);
     
@@ -334,22 +491,16 @@ Action Hook_SetTransmit_Outline(int entity, int client)
     return Plugin_Continue;
 }
 
-// 基于导航网格的“路径连通”检查（BFS，最多展开 maxDepth 层）
-// 只沿着具有 NAV_MESH_RESCUE_CLOSET 属性的导航区域进行扩展；
-// 若能在 maxDepth 内到达目标所在的导航区域，则视为连通
-// 起点和终点导航网格可不含 NAV_MESH_RESCUE_CLOSET 属性。
-bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxDepth)
+// 以起点为开始，仅在含 NAV_MESH_RESCUE_CLOSET 的区域集合内进行 BFS；
+// 一旦遇到含 NAV_SPAWN_DESTROYED_DOOR 的区域，则返回 true；否则遍历完返回 false
+bool IsPathConnectedDoor(float vStartPos[3])
 {
+    // 起点所在的最近导航区域
     Address startArea = L4D_GetNearestNavArea(vStartPos, 300.0, true, false, false, 0);
-    Address goalArea  = L4D_GetNearestNavArea(vGoalPos, 300.0, true, false, false, 0);
-
-    if (startArea == Address_Null || goalArea == Address_Null)
+    if (startArea == Address_Null)
         return false;
 
-    if (startArea == goalArea)
-        return true;
-
-    // 获取全部导航区域并预筛，仅保留含 NAV_MESH_RESCUE_CLOSET 的区域
+    // 获取全部导航区域并仅保留含 NAV_MESH_RESCUE_CLOSET 的区域
     ArrayList areas = new ArrayList();
     L4D_GetAllNavAreas(areas);
 
@@ -371,45 +522,43 @@ bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxD
         return false;
     }
 
-    // 访问标记（按 NavArea ID）
+    // 访问标记（按 NavArea ID）与 BFS 队列（Address）
     ArrayList visited = new ArrayList();
-    ArrayList queue   = new ArrayList();   // 存储 Address（可包含 startArea 以及 closetAreas 中的区域）
-    ArrayList depths  = new ArrayList();   // 存储 int 深度
+    ArrayList queue   = new ArrayList();
+
+    // 起点是 closet 区域，否则直接返回 false
+    int startAttrs = L4D_GetNavArea_SpawnAttributes(startArea);
+    if ((startAttrs & NAV_MESH_RESCUE_CLOSET) == 0)
+    {
+        delete areas;
+        delete closetAreas;
+        delete visited;
+        delete queue;
+        return false;
+    }
+
+    // 起点本身就带有 Destroyed Door，直接返回 true
+    if ((startAttrs & NAV_SPAWN_DESTROYED_DOOR) != 0)
+    {
+        delete areas;
+        delete closetAreas;
+        delete visited;
+        delete queue;
+        return true;
+    }
 
     // 起点入队
     queue.Push(startArea);
-    depths.Push(0);
     visited.Push(L4D_GetNavAreaID(startArea));
-
-    bool found = false;
 
     while (queue.Length > 0)
     {
         Address cur = queue.Get(0);
-        int depth   = depths.Get(0);
         queue.Erase(0);
-        depths.Erase(0);
 
-        if (cur == goalArea)
-        {
-            found = true;
-            break;
-        }
-
-        if (depth >= maxDepth)
-            continue;
-
-        if (L4D_NavArea_IsConnected(cur, goalArea, 4))
-        {
-            found = true;
-            break;
-        }
-
-        // 只在预筛后的 closetAreas 集合内寻找邻接候选
         for (int i = 0; i < closetTotal; i++)
         {
             Address cand = closetAreas.Get(i);
-
             if (cand == cur)
                 continue;
 
@@ -420,9 +569,18 @@ bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxD
             if (!L4D_NavArea_IsConnected(cur, cand, 4))
                 continue;
 
+            int attrs = L4D_GetNavArea_SpawnAttributes(cand);
+            if ((attrs & NAV_SPAWN_DESTROYED_DOOR) != 0)
+            {
+                delete areas;
+                delete closetAreas;
+                delete visited;
+                delete queue;
+                return true;
+            }
+
             visited.Push(candId);
             queue.Push(cand);
-            depths.Push(depth + 1);
         }
     }
 
@@ -430,13 +588,12 @@ bool IsPathConnectedRescueCloset(float vStartPos[3], float vGoalPos[3], int maxD
     delete closetAreas;
     delete visited;
     delete queue;
-    delete depths;
 
-    return found;
+    return false;
 }
 
 // 从 rescues 中选择并标记距离 doorPos 最近的最多 maxPick 个救援点（在 MAX_SEARCH_DIST 内），返回成功标记的数量
-int MarkNearestRescueWithinRange(float doorPos[3], float searchRadius, ArrayList rescues, ArrayList markLeft, int maxPick, bool checkConnected)
+int MarkNearestRescueWithinRange(float doorPos[3], float searchRadius, ArrayList rescues, ArrayList markLeft, int maxPick)
 {
     if (maxPick < 1)
         return 0;
@@ -467,8 +624,8 @@ int MarkNearestRescueWithinRange(float doorPos[3], float searchRadius, ArrayList
         if (dist > searchRadius)
             continue;
 
-        //路径连通性检查
-        if (checkConnected && !IsPathConnectedRescueCloset(doorPos, rpPos, 10))
+        //与门的连通性检查(仅当 maxPick != 1 即非单间厕所门时启用)
+        if (maxPick != 1 && !IsPathConnectedDoor(rpPos))
             continue;
 
         // 插入有序队列（按距离升序，容量 maxPick）
@@ -503,10 +660,6 @@ int MarkNearestRescueWithinRange(float doorPos[3], float searchRadius, ArrayList
             count++;
         }
     }
-
-    if(count == 0)
-        //扩大搜索距离，取消连通性检查，直到找到为止
-        count = MarkNearestRescueWithinRange(doorPos, 2 * searchRadius, rescues, markLeft, maxPick, false);
 
     return count;
 }
@@ -607,6 +760,7 @@ void ClearRescuePoints()
 }
 
 void EndDoorBlink(int door)
+
 {
     if (!IsValidEntity(door))
         return;
@@ -637,7 +791,7 @@ void ClearAll()
 
 bool CheckPosition(float pos[3], int navMask)
 {
-    Address area = L4D_GetNearestNavArea(pos, 220.0, true, false, false, 0); // 位置；搜索距离；忽略高度差距；检查视线；检查地面连接；类型
+    Address area = L4D_GetNearestNavArea(pos, 300.0, true, false, false, 0); // 位置；搜索距离；忽略高度差距；检查视线；检查地面连接；类型
 
     if (area == Address_Null)
         return false;
@@ -645,6 +799,81 @@ bool CheckPosition(float pos[3], int navMask)
     int attributes = L4D_GetNavArea_SpawnAttributes(area);
 
     return (attributes & navMask) != 0;
+}
+
+// 检查：从某个救援点实体所在的起始导航区域出发，
+// 使用 BFS 遍历与其连通的所有其他区域；
+// 一旦遇到“未包含 NAV_MESH_RESCUE_CLOSET 属性”的区域，立即返回 true；
+// 若遍历完所有连通区域仍未找到，则返回 false。
+bool IsTrueRescue(int rescueEntity)
+{
+    if (!IsValidEntity(rescueEntity))
+        return false;
+
+    float vStartPos[3];
+    GetEntPropVector(rescueEntity, Prop_Data, "m_vecOrigin", vStartPos);
+
+    Address startArea = L4D_GetNearestNavArea(vStartPos, 300.0, true, false, false, 0);
+    if (startArea == Address_Null)
+        return false;
+
+    // 获取地图全部导航区域供连通性判定使用
+    ArrayList areas = new ArrayList();
+    L4D_GetAllNavAreas(areas);
+
+    // 访问标记（按 NavArea ID），以及 BFS 队列（Address）
+    ArrayList visited = new ArrayList();
+    ArrayList queue   = new ArrayList();
+
+    // 起点入队并标记已访问
+    queue.Push(startArea);
+    visited.Push(L4D_GetNavAreaID(startArea));
+
+    bool found = false;
+
+    while (queue.Length > 0)
+    {
+        Address cur = queue.Get(0);
+        queue.Erase(0);
+
+        // 遍历所有区域，找出与当前区域“直接连通”的候选
+        int total = areas.Length;
+        for (int i = 0; i < total; i++)
+        {
+            Address cand = areas.Get(i);
+            if (cand == cur)
+                continue;
+
+            int candId = L4D_GetNavAreaID(cand);
+            if (visited.FindValue(candId) != -1)
+                continue;
+
+            // 仅考虑与 cur 双向直接连通的区域（四个方向 NAV_ALL=4）
+            if (!L4D_NavArea_IsConnected(cur, cand, 4) || !L4D_NavArea_IsConnected(cand, cur, 4))
+                continue;
+
+            // 一旦遇到“不包含 NAV_MESH_RESCUE_CLOSET 属性”的区域，立即返回 true
+            int attrs = L4D_GetNavArea_SpawnAttributes(cand);
+            if ((attrs & NAV_MESH_RESCUE_CLOSET) == 0)
+            {
+                found = true;
+                break;
+            }
+
+            // 否则继续向外扩展 BFS
+            visited.Push(candId);
+            queue.Push(cand);
+        }
+
+        if (found)
+            break;
+    }
+
+    delete areas;
+    delete visited;
+    delete queue;
+
+    return found;
 }
 
 public void Event_RoundStartPostNav(Event event, const char[] name, bool dontBroadcast)
@@ -659,12 +888,14 @@ public Action Timer_RoundStart(Handle timer)
 
     ClearAll();
 
-    // Step 1: 遍历所有 info_survivor_rescue，记录并标记为“待处理(1)”
+    // Step 1: 遍历所有 info_survivor_rescue，记录并标记为“待处理(1)”, 并且排除“假”救援点
     ArrayList rescues = new ArrayList();      // 存实体ID
     ArrayList markLeft = new ArrayList();     // 1=未被任何门统计, 0=已被某门统计
     int ent = -1;
     while ((ent = FindEntityByClassname(ent, "info_survivor_rescue")) != -1)
     {
+        if (!IsTrueRescue(ent))
+            continue;
         rescues.Push(ent);
         markLeft.Push(1);
     }
@@ -685,7 +916,7 @@ public Action Timer_RoundStart(Handle timer)
         float doorPos[3];
         GetEntPropVector(door, Prop_Send, "m_vecOrigin", doorPos);
 
-        // 检查门模型：若为“models/props_urban/outhouse_door001.mdl”，仅统计最近的一个救援点
+        // 检查门模型：若为“models/props_urban/outhouse_door001.mdl”(单间厕所门），仅统计最近的一个救援点
         bool bNearestOnly = false;
         char modelName[PLATFORM_MAX_PATH];
         if (GetEntPropString(door, Prop_Data, "m_ModelName", modelName, sizeof(modelName)))
@@ -694,12 +925,15 @@ public Action Timer_RoundStart(Handle timer)
                 bNearestOnly = true;
         }
 
-        count = MarkNearestRescueWithinRange(doorPos, float(MAX_SEARCH_DIST), rescues, markLeft, bNearestOnly ? 1 : 3, true);
+        count = MarkNearestRescueWithinRange(doorPos, float(MAX_SEARCH_DIST), rescues, markLeft, bNearestOnly ? 1 : 3);
+
+        if (count == 0)
+            continue;
 
         SetDoorCount(door, count);
     }
 
-    // Step 3: 添加未被任何门处理的救援点标记
+    // Step 3: 添加未被任何门处理的救援点
     for (int i = 0; i < rescues.Length; i++)
     {
         if (markLeft.Get(i) == 1)
@@ -717,7 +951,7 @@ public Action Timer_RoundStart(Handle timer)
     g_hTimer = CreateTimer(blinkSpeed, Timer_DoorBlink, _, TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
 
     for (int i = 0; i < g_aRescuePoints.Length; i++)
-        CreateEntityOutline(g_aRescuePoints.Get(i), 0, 255, 0); // 绿色轮廓
+        CreateEntityOutline(g_aRescuePoints.Get(i), g_iRescueColor[0], g_iRescueColor[1], g_iRescueColor[2]); // 使用配置的救援点轮廓颜色
 
     return Plugin_Continue;
 }
@@ -801,35 +1035,157 @@ public void Event_PlayerLeftSafeArea(Event event, const char[] name, bool dontBr
 
 public Action Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
 {
-    // 获取死亡玩家的userid和实体索引
     int userid = event.GetInt("userid");
     int client = GetClientOfUserId(userid);
     
-    // 验证客户端有效性
     if (client <= 0 || client > MaxClients)
         return Plugin_Continue;
     
-    // 验证客户端是否在游戏中
     if (!IsClientConnected(client) || !IsClientInGame(client))
         return Plugin_Continue;
     
-    // 验证是否为生还者团队
     if (GetClientTeam(client) != 2)
         return Plugin_Continue;
     
-    // 检查通知冷却时间
+    ConVar rescuetimeCvar = FindConVar("rescue_min_dead_time");
+    int rescueTime = (rescuetimeCvar != null) ? rescuetimeCvar.IntValue : 60;
+
     float currentTime = GetGameTime();
     if (FloatAbs(currentTime - g_fLastNotifyTime) >= 5.0)
     {
-        ConVar rescuetimeCvar = FindConVar("rescue_min_dead_time");
-        int rescueTime = (rescuetimeCvar != null) ? rescuetimeCvar.IntValue : 60;
-        
         PrintToChatAll("\x01本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个 \x01救援等待时间\x03%d\x01秒", 
             g_aBlinkingDoors.Length, g_aRescuePoints.Length, rescueTime);
         
         g_fLastNotifyTime = currentTime;
     }
+
+    if (g_hRescueStartTimer[client] != null && IsValidHandle(g_hRescueStartTimer[client]))
+    {
+        delete g_hRescueStartTimer[client];
+        g_hRescueStartTimer[client] = null;
+    }
+    g_hRescueStartTimer[client] = CreateTimer(float(rescueTime), Timer_StartRescueBlockCheck, client, TIMER_FLAG_NO_MAPCHANGE);
     
+    return Plugin_Continue;
+}
+
+//等待rescueTime时间后启动救援阻塞检测
+public Action Timer_StartRescueBlockCheck(Handle timer, any data)
+{
+    int client = data;
+
+    if (client <= 0 || client > MaxClients || !IsClientInGame(client))
+    {
+        if (g_hRescueStartTimer[client] == timer)
+            g_hRescueStartTimer[client] = null;
+        return Plugin_Stop;
+    }
+
+    if (IsPlayerAlive(client))
+    {
+        if (g_hRescueStartTimer[client] == timer)
+            g_hRescueStartTimer[client] = null;
+        return Plugin_Stop;
+    }
+
+    if (g_hRescueStartTimer[client] == timer)
+        g_hRescueStartTimer[client] = null;
+
+    if (g_hRescueRepeatTimer[client] != null && IsValidHandle(g_hRescueRepeatTimer[client]))
+    {
+        delete g_hRescueRepeatTimer[client];
+        g_hRescueRepeatTimer[client] = null;
+    }
+
+    g_hRescueRepeatTimer[client] = CreateTimer(1.0, Timer_RescueBlockCheck, client, TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
+    return Plugin_Stop;
+}
+
+// 1) 若玩家已非死亡状态或已经是待救援状态，则停止检测；
+// 2) 检查所有生还者队伍中存活玩家1200范围内是否存在标记救援点且处于 rescue_closet 区域；
+//    若有，向这些玩家发送提示信息
+public Action Timer_RescueBlockCheck(Handle timer, any data)
+{
+    int client = data;
+
+    if (client <= 0 || client > MaxClients || !IsClientInGame(client))
+    {
+        if (g_hRescueRepeatTimer[client] == timer)
+            g_hRescueRepeatTimer[client] = null;
+        return Plugin_Stop;
+    }
+
+    if (IsPlayerAlive(client))
+    {
+        if (g_hRescueRepeatTimer[client] == timer)
+            g_hRescueRepeatTimer[client] = null;
+        return Plugin_Stop;
+    }
+
+    if (g_aRescuePoints.Length == 0)
+    {
+        if (g_hRescueRepeatTimer[client] == timer)
+            g_hRescueRepeatTimer[client] = null;
+        return Plugin_Stop; // 无标记救援点
+    }
+
+    // 若有救援实体的 m_survivor 指向该死亡玩家则停止检测 若指向了其他玩家则跳过后续检测
+    for (int rpIndex = 0; rpIndex < g_aRescuePoints.Length; rpIndex++)
+    {
+        int rescueEnt = g_aRescuePoints.Get(rpIndex);
+        if (!IsValidEntity(rescueEnt))
+            continue;
+
+        int linked = -1;
+        linked = GetEntPropEnt(rescueEnt, Prop_Send, "m_survivor");
+
+        if (linked == client)
+        {
+            if (g_hRescueRepeatTimer[client] == timer)
+                g_hRescueRepeatTimer[client] = null;
+            return Plugin_Stop;
+        }
+        else if (linked >=1 && linked <= MaxClients)
+            return Plugin_Continue;
+    }
+
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!IsClientInGame(i) || GetClientTeam(i) != 2 || !IsPlayerAlive(i))
+            continue;
+
+        float pos[3];
+        GetClientAbsOrigin(i, pos);
+
+        bool nearAnyRescue = false;
+        for (int rp = 0; rp < g_aRescuePoints.Length; rp++)
+        {
+            int rescueEnt = g_aRescuePoints.Get(rp);
+            if (!IsValidEntity(rescueEnt))
+                continue;
+
+            float rpPos[3];
+            GetEntPropVector(rescueEnt, Prop_Data, "m_vecOrigin", rpPos);
+            if (GetVectorDistance(pos, rpPos) <= 1200.0)
+            {
+                nearAnyRescue = true;
+                break;
+            }
+        }
+        if (!nearAnyRescue)
+            continue;
+
+        Address area = L4D_GetNearestNavArea(pos, 300.0, true, false, false, 0);
+        if (area == Address_Null)
+            continue;
+
+        int attrs = L4D_GetNavArea_SpawnAttributes(area);
+        if ((attrs & NAV_MESH_RESCUE_CLOSET) != 0)
+        {
+            PrintHintText(i, "你所处区域因导航标记错误导致死亡的玩家无法复活 请移动到其他区域(远离被标记的救援点)");
+        }
+    }
+
     return Plugin_Continue;
 }
 
@@ -883,11 +1239,33 @@ public Action Event_SurvivorRescued(Event event, const char[] name, bool dontBro
 
 public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast)
 {
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (g_hRescueStartTimer[i] != null && IsValidHandle(g_hRescueStartTimer[i]))
+            delete g_hRescueStartTimer[i];
+        g_hRescueStartTimer[i] = null;
+
+        if (g_hRescueRepeatTimer[i] != null && IsValidHandle(g_hRescueRepeatTimer[i]))
+            delete g_hRescueRepeatTimer[i];
+        g_hRescueRepeatTimer[i] = null;
+    }
+
     ClearAll();
 }
 
 public void Event_FinaleStart(Event event, const char[] name, bool dontBroadcast)
 {
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (g_hRescueStartTimer[i] != null && IsValidHandle(g_hRescueStartTimer[i]))
+            delete g_hRescueStartTimer[i];
+        g_hRescueStartTimer[i] = null;
+
+        if (g_hRescueRepeatTimer[i] != null && IsValidHandle(g_hRescueRepeatTimer[i]))
+            delete g_hRescueRepeatTimer[i];
+        g_hRescueRepeatTimer[i] = null;
+    }
+
     ClearAll();
     
     PrintToChatAll("\x01章节救援开始！所有复活门及救援实体已\x03失效");
