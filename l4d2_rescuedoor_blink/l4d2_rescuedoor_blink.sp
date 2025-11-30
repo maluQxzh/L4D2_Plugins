@@ -2,7 +2,7 @@
 #include <sdktools>
 #include <left4dhooks>
 #pragma newdecls required
-#define PLUGIN_VERSION "1.3.0"
+#define PLUGIN_VERSION "1.4.0"
 
 #define MAX_SEARCH_DIST 600   // 救援实体为圆心最大搜索距离
 
@@ -25,6 +25,11 @@ public Plugin myinfo =
 
 /*
 change log:
+v1.4.0
+    针对一个复活房间里有4个救援点实体但只有一扇复活门和一个厕所里有一个以上救援点实体的特殊情况进行了优化
+    现在搜索处理逻辑基本符合游戏本身逻辑
+    Optimized for special cases where a rescue room has 4 rescue point entities but only one rescue door, or a restroom has more than one rescue point entity
+    The search processing logic now basically matches the game's own logic
 v1.3.0
     优化复活门搜索逻辑
     新增排除假救援点，现在假救援点不再进行任何标记
@@ -87,8 +92,6 @@ v1.0.0
     超过了救援等待时间，为什么救援点还是无法复活玩家？
         有玩家处于该救援点实体扩展出的“NAV_MESH_RESCUE_CLOSET”区域内，阻止了该救援点的生成待复活玩家的呼救（表现为不复活）
 
-    ！！！以上信息无游戏源码支撑，仅是本人通过观察实际游戏行为和导航网格属性推测并验证得出，仅供参考。如果各位有更准确的信息或新的结论，欢迎交流
-
     结论：
     1. 若救援点实体关联到复活门，插件会用颜色标记该复活门，同时用颜色数量提示被关联的救援点实体的个数，当复活门开启时，被关联的救援点不管是否已经复活玩家都会失效
     2. 若救援点实体未关联到任何复活门，则该救援点实体会被插件标记，每个被标记的救援点都可以复活一位玩家
@@ -101,10 +104,13 @@ float
     g_fLastNotifyTime;
 
 ArrayList
-    g_aBlinkingDoors,
+    g_aBlinkingDoors,  // 存储所有被标记的复活门实体
+    g_aBlinkingRescue, // 存储所有被标记的救援点实体
     g_aBlinkColors,    // 存储颜色数组
-    g_aRescuePoints,   // 存储救援点实体
-    g_aDoorEntityCounts; // 存储门实体和对应的关联次数（成对存储：实体ID，计数）
+    g_aDoorEntityCounts, // 存储门实体和对应的关联次数（成对存储：实体ID，计数）
+    g_aRescueEntities, // 储存所有救援点实体
+    g_aRescueGroups,   // 救援点实体分组
+    g_aGroupHasDoor;   // 分组是否有标准救援门
 // 轮廓系统变量
 int g_iOutlineIndex[2048] = {0};  // 存储每个实体对应的轮廓实体引用
 Handle
@@ -123,6 +129,7 @@ ConVar
 
 char g_sRescueModel[PLATFORM_MAX_PATH]; // 实际使用的模型路径
 int g_iRescueColor[3] = {0, 255, 0}; // 标记救援点轮廓默认颜色（绿色）
+int g_iDoorGroup[2048]; // 存储每个门实体所属的组ID
 
 public void OnPluginStart()
 {
@@ -179,9 +186,14 @@ public void OnPluginStart()
 
     g_fLastNotifyTime = GetGameTime();
     g_aBlinkingDoors = new ArrayList();
+    g_aBlinkingRescue = new ArrayList();
     g_aBlinkColors = new ArrayList(3); // 存储RGB值，每个颜色3个值
-    g_aRescuePoints = new ArrayList(); // 存储救援点实体标记
     g_aDoorEntityCounts = new ArrayList(2); // 存储门实体和计数（每个条目2个值：实体ID，计数）
+    g_aRescueEntities = new ArrayList();
+    g_aRescueGroups = new ArrayList();
+    g_aGroupHasDoor = new ArrayList();
+    
+    for(int i=0; i<2048; i++) g_iDoorGroup[i] = -1;
 
     // 初始化颜色配置
     UpdateBlinkColors();
@@ -491,179 +503,6 @@ Action Hook_SetTransmit_Outline(int entity, int client)
     return Plugin_Continue;
 }
 
-// 以起点为开始，仅在含 NAV_MESH_RESCUE_CLOSET 的区域集合内进行 BFS；
-// 一旦遇到含 NAV_SPAWN_DESTROYED_DOOR 的区域，则返回 true；否则遍历完返回 false
-bool IsPathConnectedDoor(float vStartPos[3])
-{
-    // 起点所在的最近导航区域
-    Address startArea = L4D_GetNearestNavArea(vStartPos, 300.0, true, false, false, 0);
-    if (startArea == Address_Null)
-        return false;
-
-    // 获取全部导航区域并仅保留含 NAV_MESH_RESCUE_CLOSET 的区域
-    ArrayList areas = new ArrayList();
-    L4D_GetAllNavAreas(areas);
-
-    ArrayList closetAreas = new ArrayList();
-    int total = areas.Length;
-    for (int i = 0; i < total; i++)
-    {
-        Address a = areas.Get(i);
-        int attrs = L4D_GetNavArea_SpawnAttributes(a);
-        if ((attrs & NAV_MESH_RESCUE_CLOSET) != 0)
-            closetAreas.Push(a);
-    }
-
-    int closetTotal = closetAreas.Length;
-    if (closetTotal == 0)
-    {
-        delete areas;
-        delete closetAreas;
-        return false;
-    }
-
-    // 访问标记（按 NavArea ID）与 BFS 队列（Address）
-    ArrayList visited = new ArrayList();
-    ArrayList queue   = new ArrayList();
-
-    // 起点是 closet 区域，否则直接返回 false
-    int startAttrs = L4D_GetNavArea_SpawnAttributes(startArea);
-    if ((startAttrs & NAV_MESH_RESCUE_CLOSET) == 0)
-    {
-        delete areas;
-        delete closetAreas;
-        delete visited;
-        delete queue;
-        return false;
-    }
-
-    // 起点本身就带有 Destroyed Door，直接返回 true
-    if ((startAttrs & NAV_SPAWN_DESTROYED_DOOR) != 0)
-    {
-        delete areas;
-        delete closetAreas;
-        delete visited;
-        delete queue;
-        return true;
-    }
-
-    // 起点入队
-    queue.Push(startArea);
-    visited.Push(L4D_GetNavAreaID(startArea));
-
-    while (queue.Length > 0)
-    {
-        Address cur = queue.Get(0);
-        queue.Erase(0);
-
-        for (int i = 0; i < closetTotal; i++)
-        {
-            Address cand = closetAreas.Get(i);
-            if (cand == cur)
-                continue;
-
-            int candId = L4D_GetNavAreaID(cand);
-            if (visited.FindValue(candId) != -1)
-                continue;
-
-            if (!L4D_NavArea_IsConnected(cur, cand, 4))
-                continue;
-
-            int attrs = L4D_GetNavArea_SpawnAttributes(cand);
-            if ((attrs & NAV_SPAWN_DESTROYED_DOOR) != 0)
-            {
-                delete areas;
-                delete closetAreas;
-                delete visited;
-                delete queue;
-                return true;
-            }
-
-            visited.Push(candId);
-            queue.Push(cand);
-        }
-    }
-
-    delete areas;
-    delete closetAreas;
-    delete visited;
-    delete queue;
-
-    return false;
-}
-
-// 从 rescues 中选择并标记距离 doorPos 最近的最多 maxPick 个救援点（在 MAX_SEARCH_DIST 内），返回成功标记的数量
-int MarkNearestRescueWithinRange(float doorPos[3], float searchRadius, ArrayList rescues, ArrayList markLeft, int maxPick)
-{
-    if (maxPick < 1)
-        return 0;
-
-    if (maxPick > 3)
-        maxPick = 3; // 最多只统计3个
-
-    int count = 0;
-
-    int topIdx[3];
-    float topDist[3];
-    for (int k = 0; k < 3; k++)
-    {
-        topIdx[k] = -1;
-        topDist[k] = -1.0;
-    }
-
-    for (int i = 0; i < rescues.Length; i++)
-    {
-        if (markLeft.Get(i) == 0)
-            continue;
-
-        int rp = rescues.Get(i);
-
-        float rpPos[3];
-        GetEntPropVector(rp, Prop_Data, "m_vecOrigin", rpPos);
-        float dist = GetVectorDistance(doorPos, rpPos);
-        if (dist > searchRadius)
-            continue;
-
-        //与门的连通性检查(仅当 maxPick != 1 即非单间厕所门时启用)
-        if (maxPick != 1 && !IsPathConnectedDoor(rpPos))
-            continue;
-
-        // 插入有序队列（按距离升序，容量 maxPick）
-        int slot = -1;
-        for (int p = 0; p < maxPick; p++)
-        {
-            if (topDist[p] < 0.0 || dist < topDist[p])
-            {
-                slot = p;
-                break;
-            }
-        }
-
-        if (slot != -1)
-        {
-            for (int k = maxPick - 1; k > slot; k--)
-            {
-                topDist[k] = topDist[k - 1];
-                topIdx[k] = topIdx[k - 1];
-            }
-            topDist[slot] = dist;
-            topIdx[slot] = i;
-        }
-    }
-
-    // 标记最近的 maxPick 个救援点
-    for (int p = 0; p < maxPick; p++)
-    {
-        if (topIdx[p] != -1)
-        {
-            markLeft.Set(topIdx[p], 0);
-            count++;
-        }
-    }
-
-    return count;
-}
-
 int FindNearestEntitybyName(int i, const char[] targetClassname)
 {
     float refPos[3];
@@ -728,16 +567,6 @@ void SetDoorCount(int doorEntity, int count)
     }
 }
 
-void AddRescuePointEntity(int rescueEntity)
-{
-    if (rescueEntity == -1) return;
-    
-    // 检查救援点是否已经在列表中
-    int index = g_aRescuePoints.FindValue(rescueEntity);
-    if (index == -1)
-        g_aRescuePoints.Push(rescueEntity);
-}
-
 // 获取门实体的关联次数
 int GetDoorCount(int doorEntity)
 {
@@ -751,12 +580,12 @@ int GetDoorCount(int doorEntity)
 
 void ClearRescuePoints()
 {
-    for (int i = 0; i < g_aRescuePoints.Length; i++)
+    for (int i = 0; i < g_aBlinkingRescue.Length; i++)
     {
-        int point = g_aRescuePoints.Get(i);
+        int point = g_aBlinkingRescue.Get(i);
         RemoveEntityOutline(point);
     }
-    g_aRescuePoints.Clear();
+    g_aBlinkingRescue.Clear();
 }
 
 void EndDoorBlink(int door)
@@ -785,8 +614,13 @@ void ClearAll()
 
     ClearDoorOutlines();
     g_aBlinkingDoors.Clear();
-    g_aDoorEntityCounts.Clear();
     ClearRescuePoints();
+    g_aDoorEntityCounts.Clear();
+    g_aRescueEntities.Clear();
+    g_aRescueGroups.Clear();
+    g_aGroupHasDoor.Clear();
+    
+    for(int i=0; i<2048; i++) g_iDoorGroup[i] = -1;
 }
 
 bool CheckPosition(float pos[3], int navMask)
@@ -801,79 +635,346 @@ bool CheckPosition(float pos[3], int navMask)
     return (attributes & navMask) != 0;
 }
 
-// 检查：从某个救援点实体所在的起始导航区域出发，
-// 使用 BFS 遍历与其连通的所有其他区域；
-// 一旦遇到“未包含 NAV_MESH_RESCUE_CLOSET 属性”的区域，立即返回 true；
-// 若遍历完所有连通区域仍未找到，则返回 false。
-bool IsTrueRescue(int rescueEntity)
+// 第一次遍历：收集所有 info_survivor_rescue 实体及其所在的 NavArea ID。
+// 第二次遍历（分组与 BFS）：
+// 对未分组的实体发起 BFS 搜索。
+// 搜索仅在 NAV_MESH_RESCUE_CLOSET 区域间进行，且要求双向连通（排除假复活点）。
+// 如果遇到其他救援点实体所在的区域，将其加入当前组。
+// 如果遇到 NAV_SPAWN_DESTROYED_DOOR 区域，标记 bHasDoor = true，并将其视为“隔断”（crossedDoor 标记），阻止跨越门的实体加入当前组，但允许 BFS 继续搜索以寻找出口
+// 如果遇到非 NAV_MESH_RESCUE_CLOSET 区域，标记 bHasExit = true（找到了出口）（排除假复活点）。
+// 后处理：
+// 如果一组救援点没有找到出口（!bHasExit），则将该组内的所有实体废弃（排除假复活点）。
+
+void ProcessRescuePoints()
 {
-    if (!IsValidEntity(rescueEntity))
-        return false;
-
-    float vStartPos[3];
-    GetEntPropVector(rescueEntity, Prop_Data, "m_vecOrigin", vStartPos);
-
-    Address startArea = L4D_GetNearestNavArea(vStartPos, 300.0, true, false, false, 0);
-    if (startArea == Address_Null)
-        return false;
-
-    // 获取地图全部导航区域供连通性判定使用
-    ArrayList areas = new ArrayList();
-    L4D_GetAllNavAreas(areas);
-
-    // 访问标记（按 NavArea ID），以及 BFS 队列（Address）
-    ArrayList visited = new ArrayList();
-    ArrayList queue   = new ArrayList();
-
-    // 起点入队并标记已访问
-    queue.Push(startArea);
-    visited.Push(L4D_GetNavAreaID(startArea));
-
-    bool found = false;
-
-    while (queue.Length > 0)
+    ArrayList s0_Entities = new ArrayList();
+    ArrayList s0_AreaIDs = new ArrayList();
+    ArrayList s0_GroupIDs = new ArrayList(); // -1: 未分配
+    ArrayList s0_GroupHasDoor = new ArrayList();
+    
+    // 1. 第一遍：收集所有 info_survivor_rescue
+    int s0_ent = -1;
+    while ((s0_ent = FindEntityByClassname(s0_ent, "info_survivor_rescue")) != -1)
     {
-        Address cur = queue.Get(0);
-        queue.Erase(0);
-
-        // 遍历所有区域，找出与当前区域“直接连通”的候选
-        int total = areas.Length;
-        for (int i = 0; i < total; i++)
+        float pos[3];
+        GetEntPropVector(s0_ent, Prop_Data, "m_vecOrigin", pos);
+        Address area = L4D_GetNearestNavArea(pos, 300.0, true, false, false, 0);
+        if (area != Address_Null)
         {
-            Address cand = areas.Get(i);
-            if (cand == cur)
-                continue;
-
-            int candId = L4D_GetNavAreaID(cand);
-            if (visited.FindValue(candId) != -1)
-                continue;
-
-            // 仅考虑与 cur 双向直接连通的区域（四个方向 NAV_ALL=4）
-            if (!L4D_NavArea_IsConnected(cur, cand, 4) || !L4D_NavArea_IsConnected(cand, cur, 4))
-                continue;
-
-            // 一旦遇到“不包含 NAV_MESH_RESCUE_CLOSET 属性”的区域，立即返回 true
-            int attrs = L4D_GetNavArea_SpawnAttributes(cand);
-            if ((attrs & NAV_MESH_RESCUE_CLOSET) == 0)
-            {
-                found = true;
-                break;
-            }
-
-            // 否则继续向外扩展 BFS
-            visited.Push(candId);
-            queue.Push(cand);
+            s0_Entities.Push(s0_ent);
+            s0_AreaIDs.Push(L4D_GetNavAreaID(area));
+            s0_GroupIDs.Push(-1);
         }
-
-        if (found)
-            break;
     }
 
-    delete areas;
-    delete visited;
-    delete queue;
+    ArrayList s0_AllAreas = new ArrayList();
+    L4D_GetAllNavAreas(s0_AllAreas);
+    int s0_TotalAreas = s0_AllAreas.Length;
 
-    return found;
+    int s0_CurrentGroupID = 0;
+    
+    for (int i = 0; i < s0_Entities.Length; i++)
+    {
+        if (s0_GroupIDs.Get(i) != -1) continue;
+
+        int thisGroupID = s0_CurrentGroupID++;
+        s0_GroupIDs.Set(i, thisGroupID);
+        
+        bool bHasDoor = false;
+        bool bHasExit = false;
+
+        // BFS 初始化
+        // 队列存储数组: [Address(as int/any), crossedDoor(0/1)]
+        ArrayList queue = new ArrayList(2); 
+        ArrayList visited = new ArrayList();
+        
+        int startEnt = s0_Entities.Get(i);
+        float startPos[3];
+        GetEntPropVector(startEnt, Prop_Data, "m_vecOrigin", startPos);
+        Address startArea = L4D_GetNearestNavArea(startPos, 300.0, true, false, false, 0);
+        
+        if (startArea != Address_Null)
+        {
+            int startAttrs = L4D_GetNavArea_SpawnAttributes(startArea);
+            bool startIsDoor = (startAttrs & NAV_SPAWN_DESTROYED_DOOR) != 0;
+            if (startIsDoor) bHasDoor = true;
+
+            any startData[2];
+            startData[0] = startArea;
+            startData[1] = 0; 
+            
+            queue.PushArray(startData);
+            visited.Push(L4D_GetNavAreaID(startArea));
+        }
+
+        while (queue.Length > 0)
+        {
+            any curData[2];
+            queue.GetArray(0, curData);
+            queue.Erase(0);
+            
+            Address curArea = curData[0];
+            bool curCrossed = curData[1] == 1;
+            
+            int curAreaID = L4D_GetNavAreaID(curArea);
+            int curAttrs = L4D_GetNavArea_SpawnAttributes(curArea);
+            bool curIsDoor = (curAttrs & NAV_SPAWN_DESTROYED_DOOR) != 0;
+
+            // 分组：检查此区域是否有其他实体
+            if (!curCrossed)
+            {
+                for (int j = 0; j < s0_Entities.Length; j++)
+                {
+                    // 跳过自己或已在当前组的实体
+                    if (s0_GroupIDs.Get(j) == thisGroupID) continue;
+
+                    if (s0_AreaIDs.Get(j) == curAreaID)
+                    {
+                        int otherGroupID = s0_GroupIDs.Get(j);
+                        if (otherGroupID == -1)
+                        {
+                            // 未分组实体，直接加入
+                            s0_GroupIDs.Set(j, thisGroupID);
+                        }
+                        else 
+                        {
+                            // 发现已分组的实体（可能是之前的组，或者是被废弃的组），将其合并到当前组
+                            // 这种情况通常发生在：当前搜索路径连通到了一个已存在的组
+                            // 我们将那个组的所有成员“拉”入当前组
+                            for (int k = 0; k < s0_Entities.Length; k++)
+                            {
+                                if (s0_GroupIDs.Get(k) == otherGroupID)
+                                {
+                                    s0_GroupIDs.Set(k, thisGroupID);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 查找邻居
+            for (int k = 0; k < s0_TotalAreas; k++)
+            {
+                Address neighbor = s0_AllAreas.Get(k);
+                if (neighbor == curArea) continue;
+
+                int neighborID = L4D_GetNavAreaID(neighbor);
+                
+                // 检查连接（双向）
+                if (!L4D_NavArea_IsConnected(curArea, neighbor, 4) || !L4D_NavArea_IsConnected(neighbor, curArea, 4))
+                    continue;
+
+                int attrs = L4D_GetNavArea_SpawnAttributes(neighbor);
+                
+                // 检查出口（非 RescueCloset）
+                if ((attrs & NAV_MESH_RESCUE_CLOSET) == 0)
+                {
+                    bHasExit = true;
+                    // 不遍历非 closet 区域
+                    continue;
+                }
+
+                // 检查门
+                bool neighborIsDoor = (attrs & NAV_SPAWN_DESTROYED_DOOR) != 0;
+                if (neighborIsDoor) bHasDoor = true;
+
+                // 正常的 RescueCloset 邻居（包括门）
+                if (visited.FindValue(neighborID) == -1)
+                {
+                    // 隔断逻辑：
+                    // 只有当"当前区域"已经是门(curIsDoor)或者是门后区域(curCrossed)时，
+                    // 进入下一个区域才算作"穿过门"(nextCrossed)。
+                    // 也就是说，如果 neighbor 是门，进入 neighbor 时 nextCrossed 还是 false（允许把门内的实体加组），
+                    // 但从 neighbor 再往外走时，因为 neighbor 是门，所以那时的 nextCrossed 就会变成 true。
+                    bool nextCrossed = curCrossed || curIsDoor;
+                    
+                    any nextData[2];
+                    nextData[0] = neighbor;
+                    nextData[1] = nextCrossed ? 1 : 0;
+                    
+                    visited.Push(neighborID);
+                    queue.PushArray(nextData);
+                }
+            }
+        }
+        
+        delete queue;
+        delete visited;
+
+        s0_GroupHasDoor.Push(bHasDoor ? 1 : 0);
+
+        // 分组后处理
+        // 如果未找到出口，丢弃该组（排除假复活点）
+        if (!bHasExit)
+        {
+            // 标记该组中的所有实体为废弃（不加入最终列表）
+            for (int j = 0; j < s0_Entities.Length; j++)
+            {
+                if (s0_GroupIDs.Get(j) == thisGroupID)
+                {
+                    s0_GroupIDs.Set(j, -2); // -2 表示废弃
+                }
+            }
+        }
+    }
+
+    // 用有效实体和组填充全局变量
+    for (int i = 0; i < s0_Entities.Length; i++)
+    {
+        int ent = s0_Entities.Get(i);
+        int groupID = s0_GroupIDs.Get(i);
+        int areaID = s0_AreaIDs.Get(i);
+        
+        PrintToChatAll("RescueEntity: %d, Area: %d, Group: %d", ent, areaID, groupID);
+        PrintToServer("RescueEntity: %d, Area: %d, Group: %d", ent, areaID, groupID);
+        
+        if (IsValidEntity(ent) && groupID >= 0)
+        {
+            g_aRescueEntities.Push(ent);
+            g_aRescueGroups.Push(groupID);
+        }
+    }
+    
+    // 复制组门状态
+    for (int i = 0; i < s0_GroupHasDoor.Length; i++)
+    {
+        g_aGroupHasDoor.Push(s0_GroupHasDoor.Get(i));
+    }
+
+    delete s0_Entities;
+    delete s0_AreaIDs;
+    delete s0_GroupIDs;
+    delete s0_GroupHasDoor;
+    delete s0_AllAreas;
+}
+
+// 筛选与搜索：遍历所有属于 HasDoor 标记组的 info_survivor_rescue 实体，搜索其 600 码范围内的救援门。
+// 排序：将所有搜索结果（距离、门ID、救援点ID、组ID）按距离升序排列。
+// 分配与计数：
+// 首次被组认领：如果门未被任何组认领，则记录该组ID，计数设为1，并标记该救援点已贡献计数。
+// 同组再次认领：如果门已被同组认领，计数+1，并标记该救援点已贡献计数。
+// 异组认领：如果门已被其他组认领，则忽略。
+// 后续处理：
+// 对未贡献计数的救援点创建外轮廓并添加到 g_BlinkingRescue 列表中
+// 对有计数的门调用 SetDoorCount 设置最终计数。
+void AssignRescueDoorsToGroups()
+{
+    // int doorOwnerGroup[2048]; // 使用全局 g_iDoorGroup
+    int doorCount[2048];
+    bool entityHasDoor[2048];
+    
+    for (int i = 0; i < 2048; i++) {
+        // doorOwnerGroup[i] = -1; // 已在 ClearAll 中重置
+        doorCount[i] = 0;
+        entityHasDoor[i] = false;
+    }
+
+    ArrayList candidates = new ArrayList(4); // [distance, door, entity, group]
+
+    // 预先收集所有救援门以提高效率
+    ArrayList allRescueDoors = new ArrayList();
+    int maxEnts = GetMaxEntities();
+    for (int i = MaxClients + 1; i < maxEnts; i++)
+    {
+        if (IsValidEntity(i) && IsRescueDoor(i))
+        {
+            allRescueDoors.Push(i);
+        }
+    }
+
+    // 1. 收集候选数据
+    for (int i = 0; i < g_aRescueEntities.Length; i++)
+    {
+        int ent = g_aRescueEntities.Get(i);
+        int groupId = g_aRescueGroups.Get(i);
+        
+        // 只处理 HasDoor 为 true 的组
+        if (groupId >= 0 && groupId < g_aGroupHasDoor.Length)
+        {
+            if (g_aGroupHasDoor.Get(groupId) == 0) continue;
+        }
+        else continue;
+
+        if (!IsValidEntity(ent)) continue;
+
+        float entPos[3];
+        GetEntPropVector(ent, Prop_Data, "m_vecOrigin", entPos);
+
+        for (int d = 0; d < allRescueDoors.Length; d++)
+        {
+            int door = allRescueDoors.Get(d);
+            
+            float doorPos[3];
+            GetEntPropVector(door, Prop_Send, "m_vecOrigin", doorPos);
+            float dist = GetVectorDistance(entPos, doorPos);
+            
+            if (dist <= 600.0)
+            {
+                any data[4];
+                data[0] = dist;
+                data[1] = door;
+                data[2] = ent;
+                data[3] = groupId;
+                candidates.PushArray(data);
+            }
+        }
+    }
+    delete allRescueDoors;
+
+    // 2. 按距离升序排序
+    candidates.Sort(Sort_Ascending, Sort_Float);
+
+    // 3. 处理候选数据
+    for (int i = 0; i < candidates.Length; i++)
+    {
+        any data[4];
+        candidates.GetArray(i, data);
+        int door = data[1];
+        int ent = data[2];
+        int group = data[3];
+        
+        if (g_iDoorGroup[door] == -1)
+        {
+            // 第一次被新组添加
+            g_iDoorGroup[door] = group;
+            doorCount[door] = 1;
+            entityHasDoor[ent] = true;
+        }
+        else if (g_iDoorGroup[door] == group)
+        {
+            // 被同组添加
+            doorCount[door]++;
+            entityHasDoor[ent] = true;
+        }
+        // 被其他组添加则不做处理
+    }
+    delete candidates;
+
+    // 4. 处理没有分配门的救援点实体
+    for (int i = 0; i < g_aRescueEntities.Length; i++)
+    {
+        int ent = g_aRescueEntities.Get(i);
+        int groupId = g_aRescueGroups.Get(i);
+        
+        if (groupId >= 0 && groupId < g_aGroupHasDoor.Length)
+        {
+            if (IsValidEntity(ent) && !entityHasDoor[ent])
+            {
+                CreateEntityOutline(ent, g_iRescueColor[0], g_iRescueColor[1], g_iRescueColor[2]); // 使用配置的救援点轮廓颜色
+                g_aBlinkingRescue.Push(ent);
+            }
+        }
+    }
+
+    // 5. 设置门计数
+    for (int i = 0; i < 2048; i++)
+    {
+        if (doorCount[i] > 0)
+        {
+            SetDoorCount(i, doorCount[i]);
+        }
+    }
 }
 
 public void Event_RoundStartPostNav(Event event, const char[] name, bool dontBroadcast)
@@ -888,70 +989,18 @@ public Action Timer_RoundStart(Handle timer)
 
     ClearAll();
 
-    // Step 1: 遍历所有 info_survivor_rescue，记录并标记为“待处理(1)”, 并且排除“假”救援点
-    ArrayList rescues = new ArrayList();      // 存实体ID
-    ArrayList markLeft = new ArrayList();     // 1=未被任何门统计, 0=已被某门统计
-    int ent = -1;
-    while ((ent = FindEntityByClassname(ent, "info_survivor_rescue")) != -1)
-    {
-        if (!IsTrueRescue(ent))
-            continue;
-        rescues.Push(ent);
-        markLeft.Push(1);
-    }
-    g_iTotalRescuePoints = rescues.Length;
+    // 给所有救援实体分组，并剔除假复活点
+    ProcessRescuePoints();
 
-    // Step 2: 遍历所有实体，筛选标准救援门范围内救援点
-    int maxEnts = GetMaxEntities();
-    for (int door = MaxClients + 1; door < maxEnts; door++)
-    {
-        if (!IsValidEntity(door))
-            continue;
+    // 记录总救援点数量
+    g_iTotalRescuePoints = g_aRescueEntities.Length;
 
-        if (!IsRescueDoor(door))
-            continue;
-
-        int count = 0;
-
-        float doorPos[3];
-        GetEntPropVector(door, Prop_Send, "m_vecOrigin", doorPos);
-
-        // 检查门模型：若为“models/props_urban/outhouse_door001.mdl”(单间厕所门），仅统计最近的一个救援点
-        bool bNearestOnly = false;
-        char modelName[PLATFORM_MAX_PATH];
-        if (GetEntPropString(door, Prop_Data, "m_ModelName", modelName, sizeof(modelName)))
-        {
-            if (StrEqual(modelName, "models/props_urban/outhouse_door001.mdl", false))
-                bNearestOnly = true;
-        }
-
-        count = MarkNearestRescueWithinRange(doorPos, float(MAX_SEARCH_DIST), rescues, markLeft, bNearestOnly ? 1 : 3);
-
-        if (count == 0)
-            continue;
-
-        SetDoorCount(door, count);
-    }
-
-    // Step 3: 添加未被任何门处理的救援点
-    for (int i = 0; i < rescues.Length; i++)
-    {
-        if (markLeft.Get(i) == 1)
-        {
-            int rp = rescues.Get(i);
-            AddRescuePointEntity(rp);
-        }
-    }
-
-    delete rescues;
-    delete markLeft;
+    // 对救援门进行分配组和计数，对于没有分配到门的救援实体，创建外轮廓提示
+    AssignRescueDoorsToGroups();
 
     // 使用配置的闪烁速度
     float blinkSpeed = GetConVarFloat(g_hBlinkSpeed);
     g_hTimer = CreateTimer(blinkSpeed, Timer_DoorBlink, _, TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
-
-    for (int i = 0; i < g_aRescuePoints.Length; i++)
-        CreateEntityOutline(g_aRescuePoints.Get(i), g_iRescueColor[0], g_iRescueColor[1], g_iRescueColor[2]); // 使用配置的救援点轮廓颜色
 
     return Plugin_Continue;
 }
@@ -1024,13 +1073,13 @@ public Action Timer_DoorBlink(Handle timer)
 
 public Action Timer_RescueNotification(Handle timer)
 {
-    PrintToChatAll("\x01救援事件触发 本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_aRescuePoints.Length);
+    PrintToChatAll("\x01救援事件触发 本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_aBlinkingRescue.Length);
     return Plugin_Continue;
 }
 
 public void Event_PlayerLeftSafeArea(Event event, const char[] name, bool dontBroadcast)
 {
-    PrintToChatAll("\x01本章节共有复活门\x03%d\x01扇 \x01救援点实体\x03%d\x01个 \x01其中标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_iTotalRescuePoints, g_aRescuePoints.Length);
+    PrintToChatAll("\x01本章节共有复活门\x03%d\x01扇 \x01救援点实体\x03%d\x01个 \x01其中标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_iTotalRescuePoints, g_aBlinkingRescue.Length);
 }
 
 public Action Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
@@ -1054,7 +1103,7 @@ public Action Event_PlayerDeath(Event event, const char[] name, bool dontBroadca
     if (FloatAbs(currentTime - g_fLastNotifyTime) >= 5.0)
     {
         PrintToChatAll("\x01本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个 \x01救援等待时间\x03%d\x01秒", 
-            g_aBlinkingDoors.Length, g_aRescuePoints.Length, rescueTime);
+            g_aBlinkingDoors.Length, g_aBlinkingRescue.Length, rescueTime);
         
         g_fLastNotifyTime = currentTime;
     }
@@ -1122,7 +1171,7 @@ public Action Timer_RescueBlockCheck(Handle timer, any data)
         return Plugin_Stop;
     }
 
-    if (g_aRescuePoints.Length == 0)
+    if (g_aBlinkingRescue.Length == 0)
     {
         if (g_hRescueRepeatTimer[client] == timer)
             g_hRescueRepeatTimer[client] = null;
@@ -1130,9 +1179,9 @@ public Action Timer_RescueBlockCheck(Handle timer, any data)
     }
 
     // 若有救援实体的 m_survivor 指向该死亡玩家则停止检测 若指向了其他玩家则跳过后续检测
-    for (int rpIndex = 0; rpIndex < g_aRescuePoints.Length; rpIndex++)
+    for (int rpIndex = 0; rpIndex < g_aBlinkingRescue.Length; rpIndex++)
     {
-        int rescueEnt = g_aRescuePoints.Get(rpIndex);
+        int rescueEnt = g_aBlinkingRescue.Get(rpIndex);
         if (!IsValidEntity(rescueEnt))
             continue;
 
@@ -1158,9 +1207,9 @@ public Action Timer_RescueBlockCheck(Handle timer, any data)
         GetClientAbsOrigin(i, pos);
 
         bool nearAnyRescue = false;
-        for (int rp = 0; rp < g_aRescuePoints.Length; rp++)
+        for (int rp = 0; rp < g_aBlinkingRescue.Length; rp++)
         {
-            int rescueEnt = g_aRescuePoints.Get(rp);
+            int rescueEnt = g_aBlinkingRescue.Get(rp);
             if (!IsValidEntity(rescueEnt))
                 continue;
 
@@ -1195,20 +1244,49 @@ public void Event_RescueDoorOpen(Event event, const char[] name, bool dontBroadc
     int doorEntity = event.GetInt("entindex");
     int find_entity = FindNearestEntitybyName(doorEntity, "info_survivor_rescue");
 
+    if (find_entity == -1) return;
+
     float pos[3];
     GetEntPropVector(find_entity, Prop_Data, "m_vecOrigin", pos);
 
     if(!CheckPosition(pos, NAV_MESH_FINALE))
     {
-        int i = g_aBlinkingDoors.FindValue(doorEntity);
-        if (i != -1)
+        // 寻找被开启的门所属的组
+        int targetGroup = g_iDoorGroup[doorEntity];
+
+        if (targetGroup != -1)
         {
-            EndDoorBlink(doorEntity);
-            RemoveEntityOutline(doorEntity);
-            g_aBlinkingDoors.Erase(i);
+            // 移除所有属于该组的门
+            for (int j = g_aBlinkingDoors.Length - 1; j >= 0; j--)
+            {
+                int bDoor = g_aBlinkingDoors.Get(j);
+                if (!IsValidEntity(bDoor)) 
+                {
+                    g_aBlinkingDoors.Erase(j);
+                    continue;
+                }
+                
+                if (g_iDoorGroup[bDoor] == targetGroup)
+                {
+                    EndDoorBlink(bDoor);
+                    RemoveEntityOutline(bDoor);
+                    g_aBlinkingDoors.Erase(j);
+                }
+            }
         }
+        else
+        {
+            int i = g_aBlinkingDoors.FindValue(doorEntity);
+            if (i != -1)
+            {
+                EndDoorBlink(doorEntity);
+                RemoveEntityOutline(doorEntity);
+                g_aBlinkingDoors.Erase(i);
+            }
+        }
+
         float currentTime = GetGameTime();
-        PrintToChatAll("\x01复活门已被开启 \x01本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_aRescuePoints.Length);
+        PrintToChatAll("\x01复活门已被开启 \x01本章节剩余复活门\x03%d\x01扇 \x01剩余标记的救援点实体\x03%d\x01个", g_aBlinkingDoors.Length, g_aBlinkingRescue.Length);
         g_fLastNotifyTime = currentTime;
     }
 }
@@ -1222,9 +1300,9 @@ public Action Event_SurvivorRescued(Event event, const char[] name, bool dontBro
     int find_entity_rescue = FindNearestEntitybyName(victimClient, "info_survivor_rescue");
 
     RemoveEntityOutline(find_entity_rescue);
-    int rpIndex = g_aRescuePoints.FindValue(find_entity_rescue);
+    int rpIndex = g_aBlinkingRescue.FindValue(find_entity_rescue);
     if (rpIndex != -1)
-        g_aRescuePoints.Erase(rpIndex);
+        g_aBlinkingRescue.Erase(rpIndex);
 
     float currentTime = GetGameTime();
     if (FloatAbs(currentTime - g_fLastNotifyTime) >= 5.0)
