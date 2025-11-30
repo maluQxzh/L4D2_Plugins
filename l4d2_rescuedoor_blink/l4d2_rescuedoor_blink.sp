@@ -824,10 +824,10 @@ void ProcessRescuePoints()
     {
         int ent = s0_Entities.Get(i);
         int groupID = s0_GroupIDs.Get(i);
-        int areaID = s0_AreaIDs.Get(i);
+        //int areaID = s0_AreaIDs.Get(i);
         
-        PrintToChatAll("RescueEntity: %d, Area: %d, Group: %d", ent, areaID, groupID);
-        PrintToServer("RescueEntity: %d, Area: %d, Group: %d", ent, areaID, groupID);
+        //PrintToChatAll("RescueEntity: %d, Area: %d, Group: %d", ent, areaID, groupID);
+        //PrintToServer("RescueEntity: %d, Area: %d, Group: %d", ent, areaID, groupID);
         
         if (IsValidEntity(ent) && groupID >= 0)
         {
