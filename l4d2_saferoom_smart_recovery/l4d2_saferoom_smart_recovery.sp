@@ -2,7 +2,7 @@
 #include <sourcemod>
 #include <sdktools_sound>
 #include <left4dhooks>
-#define PLUGIN_VERSION "1.1.0"
+#define PLUGIN_VERSION "1.1.2"
 
 #define NAV_MESH_PLAYER_START 128 // 玩家起始区域标志
 
@@ -17,6 +17,8 @@ public Plugin:myinfo =
 
 /*
 change log:
+v1.1.2(2025-12-04)
+	Fix Bugs
 v1.1.1
 	Remove ConVar "l4d2_saferoom_smart_recovery_RemoveBlackAndWhite", plugin automatically handles whether to remove black and white status
 	When players trigger temporary health retention to the next chapter, the plugin will not perform any processing
@@ -34,7 +36,6 @@ int
 	iSurvivorRespawnHealth,
 	iCustomSaferoomHealth,
 	iUseCustomValue,
-	//iRemoveBlackAndWhite,
 	iHealthToSet,
 	iUseTempHealthRemain,
 	iTempHealthRemainValue,
@@ -44,7 +45,6 @@ int
 ConVar
 	hUseCustomValue,
 	hCustomSaferoomHealth,
-	//hRemoveBlackAndWhite,
 	hUseTempHealthRemain,
 	hTempHealthRemainValue,
 	hDebugInfo;
@@ -57,15 +57,12 @@ public void OnPluginStart()
 	decl String:game_name[64];
 	GetGameFolderName(game_name, sizeof(game_name));
 	if (!StrEqual(game_name, "left4dead2", false))
-	{		
 		SetFailState("Plugin supports Left 4 Dead 2 only.");
-	}
 	
 	CreateConVar("l4d2_saferoom_smart_recovery_version", PLUGIN_VERSION, "l4d2_saferoom_smart_recovery version", FCVAR_NOTIFY|FCVAR_REPLICATED|FCVAR_DONTRECORD);
 	
 	hUseCustomValue = CreateConVar("l4d2_saferoom_smart_recovery_CanWeUseCustomValue", "0", "0=默认为50(z_survivor_respawn_health)(部分地图为100)，1=启用自定义恢复值   If set to 0, the default recovery value is 50 (100 on some maps); if set to 1, custom recovery values are enabled.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
 	hCustomSaferoomHealth = CreateConVar("l4d2_saferoom_smart_recovery_CustomSaferoomHealth", "50", "启用自定义恢复值时有效，回复至多少生命值   Effective if custom recovery values are enabled – how much health is restored to.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 1.0, true, 100.0);
-	//hRemoveBlackAndWhite = CreateConVar("l4d2_saferoom_smart_recovery_RemoveBlackAndWhite", "1", "是否移除黑白和心跳声   Whether to remove the black and white effect and heartbeat sound.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
 	hUseTempHealthRemain = CreateConVar("l4d2_saferoom_smart_recovery_UseTempHealthRemain", "1", "是否启用保留虚血   Whether to enable remaining temporary health values.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
 	hTempHealthRemainValue = CreateConVar("l4d2_saferoom_smart_recovery_TempHealthRemainValue", "20", "启用保留虚血时有效，实血+虚血大于等于设定恢复值多少时保留   Effective when retaining temporary health values is enabled. Retain when the sum of health and temporary health is greater than or equal to TempHealthRemainValue.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 99.0);
 	hDebugInfo = CreateConVar("l4d2_saferoom_smart_recovery_hDebugInfo", "0", "是否输出调试信息", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
@@ -74,7 +71,6 @@ public void OnPluginStart()
 	
 	HookEvent("map_transition", Event_MapTransition, EventHookMode_Pre);
 	HookEvent("round_start_post_nav", Event_RoundStartPostNav, EventHookMode_PostNoCopy);
-	//HookEvent("round_end", Event_RoundEnd);
 	HookEvent("player_left_safe_area", Event_PlayerLeftSafeArea);
 }
 
@@ -103,15 +99,17 @@ int GetPlayerTempHealth(int client)
 	return tempHealth < 0 ? 0 : tempHealth;
 }
 
-void RemoveBlackAndWhite(int client)
+void CheatCommand(int client, const char[] command, const char[] arguments)
 {
-	SetEntProp(client, Prop_Send, "m_currentReviveCount", 0);
-	SetEntProp(client, Prop_Send, "m_bIsOnThirdStrike", 0);
-	StopSound(client, SNDCHAN_AUTO, "player/heartbeatloop.wav");
+	int flags = GetCommandFlags(command);
+	SetCommandFlags(command, flags & ~FCVAR_CHEAT);
+	FakeClientCommand(client, "%s %s", command, arguments);
+	SetCommandFlags(command, flags);
 }
 
 void SetPlayerHealth(int client, int value)
 {
+	CheatCommand(client, "give", "health");
 	SetEntPropFloat(client, Prop_Send, "m_healthBuffer", 0.0);
 	SetEntityHealth(client, value);
 }
@@ -129,37 +127,26 @@ bool IsPlayerFallen(int client)
 
 bool CheckPosition(float pos[3])
 {
-	// 使用left4dhooks API获取最近的导航区域
 	Address area = L4D_GetNearestNavArea(pos, 220.0, true, false, false, 0);//位置；搜索距离；忽略高度差距；检查视线；检查地面连接；类型
 
 	if (area == Address_Null)
-	{
 		return false;
-	}
 
-	// 获取区域属性
 	int attributes = L4D_GetNavArea_SpawnAttributes(area);
-	
-	// 检测是否存在包含player_start属性的区域
 	bool isPlayerStart = (attributes & NAV_MESH_PLAYER_START) != 0;
 
 	if (isPlayerStart)
-	{
 		return true;
-	}
 	else
-	{
 		return false;
-	}
 }
 
 bool CheckPlayerReady(int client)
 {
 	if ((IsClientConnected(client) && !IsClientInGame(client)) || !IsClientConnected(client))
-	{
 		return false;
-	}
-	return true;
+	else
+		return true;
 }
 
 bool CheckEntityHasAttribute()
@@ -174,15 +161,12 @@ bool CheckEntityHasAttribute()
 		GetEntPropVector(entity, Prop_Data, "m_vecOrigin", origin);
 		if (CheckPosition(origin))
 		{
-			//foundPlayerStart = true;
 			if (PrintDebugInfo(hDebugInfo))
 				PrintToChatAll("NAV_MESH_PLAYER_START: Yes");
 			return true;
 		}
 		else
-		{
 			return false;
-		}
 	}
 	if (PrintDebugInfo(hDebugInfo))
 			PrintToChatAll("info_player_start entity: Not Find");
@@ -194,9 +178,7 @@ bool CheckAllPlayerReady()
 	for (new i = 1; i <= MaxClients; i++)
 	{
 		if ((IsClientConnected(i)) == true && (IsClientInGame(i)== false))
-		{
 			return false;
-		}
 	}
 	if (PrintDebugInfo(hDebugInfo))
 		PrintToChatAll("AllPlayerReady");
@@ -206,7 +188,7 @@ bool CheckAllPlayerReady()
 public void Event_RoundStartPostNav(Event event, const char[] name, bool dontBroadcast)
 {
 	if (PrintDebugInfo(hDebugInfo))
-			PrintToChatAll("MapNavComplete");
+		PrintToChatAll("MapNavComplete");
 	
 	g_iPlayerCheckTime = 0;
 	g_iPlayerHealedFlags = 0;
@@ -217,9 +199,7 @@ public void Event_RoundStartPostNav(Event event, const char[] name, bool dontBro
 	if (iUseCustomValue == 0)
 	{	
 		if (CheckEntityHasAttribute())
-		{
 			g_bInfoPlayerStartHasAttribute = true;
-		}
 
 		CreateTimer(0.5, Timer_RoundStart, _, TIMER_REPEAT);
 	}
@@ -235,46 +215,31 @@ public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBr
 	iCustomSaferoomHealth = hCustomSaferoomHealth.IntValue;
 	iUseCustomValue = hUseCustomValue.IntValue;
 	iSurvivorRespawnHealth = FindConVar("z_survivor_respawn_health").IntValue;
-	//iRemoveBlackAndWhite = hRemoveBlackAndWhite.IntValue;
 	iUseTempHealthRemain = hUseTempHealthRemain.IntValue;
 	iTempHealthRemainValue = hTempHealthRemainValue.IntValue;
 	
 	if (iUseCustomValue == 1)
-	{
 		iHealthToSet = iCustomSaferoomHealth;
-	}
 	else
-	{
 		iHealthToSet = iSurvivorRespawnHealth;
-	}
+
 	for (new i = 1; i <= MaxClients; i++)
 	{
 		if (IsClientConnected(i) && IsClientInGame(i) && GetClientTeam(i) == 2)
 		{
-			if (IsPlayerFalling(i))
-			{
+			if (IsPlayerFalling(i) || IsPlayerFallen(i))
 				L4D2_VScriptWrapper_ReviveFromIncap(i);
-			}
-			if (IsPlayerFallen(i))
-			{
-				L4D2_VScriptWrapper_ReviveFromIncap(i);
-			}
+
 			//SetEntProp(i, Prop_Send, "m_iHideHUD", 64);
 			if (iUseTempHealthRemain == 1)
 			{
 				if ((GetClientHealth(i) + GetPlayerTempHealth(i) <= iHealthToSet + iTempHealthRemainValue) && (GetClientHealth(i) < iHealthToSet))
-				{
 					SetPlayerHealth(i, iHealthToSet);
-					RemoveBlackAndWhite(i);
-				}
 			}
 			else
 			{
 				if (GetClientHealth(i) <= iHealthToSet)
-				{
 					SetPlayerHealth(i, iHealthToSet);
-					RemoveBlackAndWhite(i);
-				}
 			}
 		}
 	}
@@ -289,7 +254,6 @@ void RoundStartHealingForPlayer(int client)
 		if (GetClientHealth(client) < 100)
 		{
 			SetPlayerHealth(client, 100);
-			RemoveBlackAndWhite(client);
 			if (PrintDebugInfo(hDebugInfo))
 				PrintToServer("Healing");
 		}
@@ -308,7 +272,6 @@ void RoundStartHealingForPlayer(int client)
 				if (PrintDebugInfo(hDebugInfo))
 					PrintToServer("Healing");
 				SetPlayerHealth(client, 100);
-				RemoveBlackAndWhite(client);
 			}
 		}
 		else
@@ -334,17 +297,14 @@ public Action Timer_RoundStart(Handle timer)
 		{
 			// 玩家已准备好且未被治疗过
 			if (!(g_iPlayerHealedFlags & (1 << i)) && GetClientTeam(i) == 2)
-			{
 				RoundStartHealingForPlayer(i);
-			}
+
 			g_iPlayerHealedFlags |= (1 << i);  // 标记玩家已检查
 		}
 	}
 
 	if (CheckAllPlayerReady())
-	{
 		return Plugin_Stop;
-	}
 	
 	// 如果超过600次检查（五分钟）仍然有玩家未准备好或有玩家已经离开安全区域，停止定时器
 	if (g_iPlayerCheckTime >= 600 || g_bIsLeftSafeArea)
