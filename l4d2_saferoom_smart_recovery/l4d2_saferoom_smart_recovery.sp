@@ -63,7 +63,7 @@ public void OnPluginStart()
 	
 	hUseCustomValue = CreateConVar("l4d2_saferoom_smart_recovery_CanWeUseCustomValue", "0", "0=默认为50(z_survivor_respawn_health)(部分地图为100)，1=启用自定义恢复值   If set to 0, the default recovery value is 50 (100 on some maps); if set to 1, custom recovery values are enabled.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
 	hCustomSaferoomHealth = CreateConVar("l4d2_saferoom_smart_recovery_CustomSaferoomHealth", "50", "启用自定义恢复值时有效，回复至多少生命值   Effective if custom recovery values are enabled – how much health is restored to.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 1.0, true, 100.0);
-	hUseTempHealthRemain = CreateConVar("l4d2_saferoom_smart_recovery_UseTempHealthRemain", "1", "是否启用保留虚血   Whether to enable remaining temporary health values.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
+	hUseTempHealthRemain = CreateConVar("l4d2_saferoom_smart_recovery_UseTempHealthRemain", "1", "是否启用保留虚血   Whether to enable remaining temporary health values.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 2.0);
 	hTempHealthRemainValue = CreateConVar("l4d2_saferoom_smart_recovery_TempHealthRemainValue", "20", "启用保留虚血时有效，实血+虚血大于等于设定恢复值多少时保留   Effective when retaining temporary health values is enabled. Retain when the sum of health and temporary health is greater than or equal to TempHealthRemainValue.", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 99.0);
 	hDebugInfo = CreateConVar("l4d2_saferoom_smart_recovery_hDebugInfo", "0", "是否输出调试信息", FCVAR_NOTIFY|FCVAR_REPLICATED, true, 0.0, true, 1.0);
 	
@@ -107,11 +107,12 @@ void CheatCommand(int client, const char[] command, const char[] arguments)
 	SetCommandFlags(command, flags);
 }
 
-void SetPlayerHealth(int client, int value)
+void SetPlayerHealth(int client, int value, float tempHealth = 0.0)
 {
 	CheatCommand(client, "give", "health");
-	SetEntPropFloat(client, Prop_Send, "m_healthBuffer", 0.0);
 	SetEntityHealth(client, value);
+	SetEntPropFloat(client, Prop_Send, "m_healthBufferTime", GetGameTime());
+	SetEntPropFloat(client, Prop_Send, "m_healthBuffer", tempHealth);
 }
 
 //挂边状态.
@@ -235,6 +236,21 @@ public Action Event_MapTransition(Handle:event, const String:name[], bool:dontBr
 			{
 				if ((GetClientHealth(i) + GetPlayerTempHealth(i) <= iHealthToSet + iTempHealthRemainValue) && (GetClientHealth(i) < iHealthToSet))
 					SetPlayerHealth(i, iHealthToSet);
+			}
+			else if (iUseTempHealthRemain == 2)
+			{
+				int realHealth = GetClientHealth(i); int tempHealth = GetPlayerTempHealth(i);
+				if (realHealth > iHealthToSet)
+					continue;
+				else if (realHealth + tempHealth > iHealthToSet)
+				{
+					int newTempHealth = realHealth + tempHealth - iHealthToSet;
+					SetPlayerHealth(i, iHealthToSet, float(newTempHealth));
+				}
+				else
+				{
+					SetPlayerHealth(i, iHealthToSet);
+				}
 			}
 			else
 			{
